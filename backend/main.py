@@ -3,7 +3,7 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from . import auth, config, curriculum, db, live, usage, voice
-from .llm import TRUNCATED_MARK, stream_tutor_reply
+from .llm import NO_NOTES_MARK, TRUNCATED_MARK, stream_tutor_reply
 from .router import router
 import asyncio
 import json
@@ -30,6 +30,7 @@ class ChatRequest(BaseModel):
     level: str = "undergraduate"
     subject: str = ""
     voice_mode: bool = False
+    notes_mode: bool = False      # written notes only: the spoken lesson comes separately from /api/lesson
     language: str = "en"
 
 CACHE_GENERATION = "3"      # bump to make every browser drop its cached copy of the app once
@@ -134,7 +135,7 @@ async def chat(req: ChatRequest, user: dict = Depends(auth.current_user)):
         failed = False
         try:
             async for piece in stream_tutor_reply(
-                message, req.level, req.language, history, req.subject.strip()[:100], req.voice_mode
+                message, req.level, req.language, history, req.subject.strip()[:100], req.voice_mode, req.notes_mode
             ):
                 collected += piece
                 yield piece
@@ -143,7 +144,7 @@ async def chat(req: ChatRequest, user: dict = Depends(auth.current_user)):
             yield f"\n\n[Error generating response: {exc}]"
         finally:
             reply = _clean_reply(collected)
-            if reply and not failed:
+            if reply and not failed and not reply.startswith(NO_NOTES_MARK):
                 # FIX Issue #7: Run DB write in a separate thread to prevent asyncio blocking
                 await asyncio.to_thread(db.add_message, cid, "assistant", reply)
 
@@ -157,18 +158,41 @@ async def chat(req: ChatRequest, user: dict = Depends(auth.current_user)):
         },
     )
 
+@app.post("/api/lesson")
+async def lesson(req: ChatRequest, user: dict = Depends(auth.current_user)):
+    """The spoken explanation for the normal voice (same teacher style as Live). Streamed as plain text for text-to-speech;
+    not saved and not counted: the written notes request (/api/chat) is what is saved and counted."""
+    if req.level not in config.ACADEMIC_LEVELS or req.language not in config.SUPPORTED_LANGUAGES:
+        raise HTTPException(400, "Invalid level or language")
+    message = req.message.strip()
+    if not message or len(message) > 4000:
+        raise HTTPException(400, "Message is empty or too long")
+    history = []
+    if req.conversation_id and db.get_conversation(user["email"], req.conversation_id):
+        history = db.get_messages(req.conversation_id, limit=HISTORY_TURNS)
+    history = [m for m in history if not str(m.get("content", "")).startswith(NO_NOTES_MARK)]
+
+    async def spoken():
+        async for piece in stream_tutor_reply(message, req.level, req.language, history, req.subject.strip()[:100],
+                                              True, False, True):
+            yield piece
+
+    return StreamingResponse(spoken(), media_type="text/plain", headers={"X-Accel-Buffering": "no"})
+
+
 class TTSRequest(BaseModel):
     text: str
     gender: str = "female"
     language: str = "en"
+    voice: str | None = None
 
 @app.post("/api/tts")
 async def tts(req: TTSRequest, user: dict = Depends(auth.current_user)):
     try:
-        audio = await voice.text_to_speech(req.text[:2500], req.gender, req.language)
+        audio = await voice.text_to_speech(req.text[:2500], req.gender, req.language, req.voice)
     except Exception as exc:
         raise HTTPException(502, f"TTS failed: {exc}")
-    return Response(audio, media_type="audio/mpeg")
+    return Response(audio, media_type="audio/wav" if audio[:4] == b"RIFF" else "audio/mpeg")
 
 @app.post("/api/stt")
 async def stt(file: UploadFile = File(...), language: str = Form(""), user: dict = Depends(auth.current_user)):

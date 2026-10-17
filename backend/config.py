@@ -55,6 +55,8 @@ GROQ_TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "8000"))
 
 # ---------- Live teacher (Gemini Live, server-to-server) ----------
 LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
+GEMINI_TTS = os.getenv("GEMINI_TTS", "1") != "0"      # normal (non-Live) voice uses the same Gemini voices as the Live teacher
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 # Default Gemini prebuilt voices for the Female / Male setting (the student can pick any of the 30 in Settings).
 LIVE_VOICE_FEMALE = os.getenv("GEMINI_LIVE_VOICE_FEMALE", "Sulafat").strip()
 LIVE_VOICE_MALE = os.getenv("GEMINI_LIVE_VOICE_MALE", "Charon").strip()

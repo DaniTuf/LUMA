@@ -40,11 +40,46 @@ _tts_cache: dict = {}
 _TTS_CACHE_MAX = 300
 
 
-async def text_to_speech(text: str, gender: str = "female", language: str = "en") -> bytes:
-    key = (config.TTS_PROVIDER, text, gender, language)
+def _wav(pcm: bytes, rate: int = 24000) -> bytes:
+    import struct
+    return (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+            + b"data" + struct.pack("<I", len(pcm)) + pcm)
+
+
+async def _gemini_tts(text: str, gender: str, voice: str | None) -> bytes:
+    """The same Gemini voices as the Live teacher (Sulafat, Charon, ...), so the normal voice sounds just as natural."""
+    from google import genai
+    from google.genai import types
+    from .live import pick_voice
+    client = genai.Client(api_key=config.GEMINI_API_KEY)
+    cfg = types.GenerateContentConfig(
+        response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=pick_voice(voice, gender) or "Sulafat"))))
+    pcm = bytearray()
+    stream = await client.aio.models.generate_content_stream(model=config.GEMINI_TTS_MODEL, contents=text, config=cfg)
+    async for chunk in stream:
+        parts = chunk.candidates[0].content.parts if chunk.candidates and chunk.candidates[0].content else None
+        for p in parts or []:
+            if p.inline_data and p.inline_data.data:
+                pcm.extend(p.inline_data.data)
+    if not pcm:
+        raise RuntimeError("Gemini TTS returned no audio")
+    return _wav(bytes(pcm))
+
+
+async def text_to_speech(text: str, gender: str = "female", language: str = "en", voice: str | None = None) -> bytes:
+    key = (config.TTS_PROVIDER, text, gender, language, voice)
     if key in _tts_cache:
         return _tts_cache[key]
-    audio, from_primary = await _synthesize(text, gender, language)
+    audio, from_primary = None, False
+    if config.GEMINI_TTS and config.GEMINI_API_KEY:
+        try:
+            audio, from_primary = await asyncio.wait_for(_gemini_tts(text, gender, voice), timeout=25), True
+        except Exception:
+            audio = None                                     # quota or network problem: fall back to the old voices below
+    if audio is None:
+        audio, from_primary = await _synthesize(text, gender, language)
     if from_primary:  # don't cache fallback audio, so ElevenLabs takes over as soon as it works
         if len(_tts_cache) >= _TTS_CACHE_MAX:
             _tts_cache.pop(next(iter(_tts_cache)))
@@ -121,8 +156,28 @@ STT_PROMPTS = {
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 
 
+def _sniff_audio(audio: bytes, filename: str, content_type: str) -> tuple[str, str]:
+    """Name the file after what it really is. Browsers differ (Chrome records WebM/Ogg, Safari and
+    phones record MP4), and Whisper rejects a file whose bytes don't match its extension."""
+    head = audio[:12]
+    if head[:4] == b"\x1a\x45\xdf\xa3":
+        return "audio.webm", "audio/webm"
+    if head[:4] == b"OggS":
+        return "audio.ogg", "audio/ogg"
+    if head[4:8] == b"ftyp":
+        return "audio.m4a", "audio/mp4"
+    if head[:4] == b"RIFF":
+        return "audio.wav", "audio/wav"
+    if head[:4] == b"fLaC":
+        return "audio.flac", "audio/flac"
+    if head[:3] == b"ID3" or (len(head) > 1 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0):
+        return "audio.mp3", "audio/mpeg"
+    return filename, content_type
+
+
 async def _groq_transcribe(audio: bytes, filename: str, content_type: str, language: str | None = None) -> dict:
     """One Whisper call. Returns {"text", "lang" (Whisper's language name), "conf" (mean segment log-prob)}."""
+    filename, content_type = _sniff_audio(audio, filename, content_type)
     data = {"model": config.GROQ_STT_MODEL, "temperature": "0", "response_format": "verbose_json"}
     if language:
         data["language"] = language
@@ -144,6 +199,8 @@ async def _groq_transcribe(audio: bytes, filename: str, content_type: str, langu
                     wait = 3.0
                 await asyncio.sleep(min(max(wait, 1.0), 20.0))
                 continue
+            if res.status_code == 400:
+                raise RuntimeError(f"Groq rejected the audio ({len(audio)} bytes, {content_type}): {res.text[:200]}")
             res.raise_for_status()
             body = res.json()
             logprobs = [s["avg_logprob"] for s in body.get("segments", []) if "avg_logprob" in s]

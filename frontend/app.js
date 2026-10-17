@@ -256,6 +256,11 @@ formEl.addEventListener("submit", async (e) => {
     console.log("[voice-timing] 0ms: /api/chat request sent");
   }
 
+  // The spoken lesson runs in parallel with the notes and is only heard, never shown or read from the notes.
+  const lessonTask = voiceMode
+    ? runLesson({ message, level, language, subject: subjectEl.value, conversation_id: currentConvId })
+    : null;
+
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
@@ -266,7 +271,8 @@ formEl.addEventListener("submit", async (e) => {
         level,
         language,
         subject: subjectEl.value,
-        voice_mode: voiceMode,
+        voice_mode: false,
+        notes_mode: voiceMode, // with voice, the screen gets written notes and the voice gets its own spoken lesson
       }),
     });
 
@@ -296,18 +302,15 @@ formEl.addEventListener("submit", async (e) => {
         firstByteLogged = true;
         console.log(`[voice-timing] ${Math.round(performance.now() - voiceT0)}ms: first text byte from /api/chat`);
       }
-      // Speak sentences as they finish streaming in, in parallel with the text
-      // rendering on screen — not after the whole answer is done.
-      if (voiceMode) queueSpeechFromText(shown);
     }
-    const shownText = fullText.replace(TRUNC_MARK, "");
+    if (voiceMode) {
+      const spoken = await lessonTask;
+      // Greetings and small talk have no notes: show what the teacher said instead of nothing.
+      if (fullText.includes(NO_NOTES_MARK)) fullText = spoken;
+    }
     streamDone = true;
     if (!holdText) renderLatest(); // otherwise rendered when the voice starts
-    // Not trimmed: flushSpeechQueue's offsets must line up with the untrimmed text used while streaming.
-    if (voiceMode) {
-      flushSpeechQueue(shownText);
-      if (!speechQueue.length && !playerRunning) releaseText(); // nothing to speak
-    }
+    if (voiceMode && !speechQueue.length && !playerRunning) releaseText(); // nothing to speak
   } catch (err) {
     holdText = false;
     assistantBody.textContent = "Network error: " + err.message;
@@ -502,7 +505,7 @@ function flushSpeechQueue(finalShownText) {
 // like numbered-list markers ("1.") and abbreviations ("e.g.") each end a "sentence" and
 // would fire off a separate one-word TTS request, sounding choppy and hammering the free
 // voice service. The very first chunk is exempt so speech still starts immediately.
-const MIN_CHUNK = 70;
+const MIN_CHUNK = 170; // the Gemini voice makes whole phrases at once, so longer chunks sound smoother (fewer joins)
 // Don't wait for the model's first full sentence before speaking anything — a long first
 // clause with no punctuation yet would mean several seconds of dead air. Once this many
 // characters have piled up, cut at the last word boundary and speak that fragment right
@@ -557,13 +560,41 @@ function drainCompleteSentences(isFinal) {
   }
 }
 
+const NO_NOTES_MARK = "[[LUMA_NO_NOTES]]";
+
+// Streams the spoken lesson from /api/lesson into the speech queue as it is written. Returns the full spoken text.
+async function runLesson(body) {
+  let text = "";
+  try {
+    const res = await fetch("/api/lesson", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(res.status);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+      queueSpeechFromText(text);
+    }
+    flushSpeechQueue(text);
+  } catch (err) {
+    releaseText();
+    setStatus("Voice is unavailable right now (" + err.message + "). The written answer is above.");
+  }
+  return text.replace(TRUNC_MARK, "").trim();
+}
+
 async function fetchSpeech(text, label) {
   const t = Math.round(performance.now() - voiceT0);
   console.log(`[voice-timing] ${t}ms: /api/tts request sent (${label}, ${text.length} chars)`);
   const res = await fetch("/api/tts", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, gender: voiceGender, language: languageEl.value }),
+    body: JSON.stringify({ text, gender: voiceGender, language: languageEl.value, voice: liveVoiceEl.value || undefined }),
   });
   console.log(`[voice-timing] ${Math.round(performance.now() - voiceT0)}ms: /api/tts response received (${label})`);
   if (!res.ok) throw new Error(res.status);
@@ -702,7 +733,8 @@ function useTranscript(text, spokenLang) {
 async function fallbackTranscribe() {
   setStatus("Transcribing…");
   const fd = new FormData();
-  fd.append("file", new Blob(sttChunks, { type: "audio/webm" }), "audio.webm");
+  const mime = (sttChunks[0] && sttChunks[0].type) || "audio/webm";
+  fd.append("file", new Blob(sttChunks, { type: mime }), mime.includes("mp4") ? "audio.m4a" : mime.includes("ogg") ? "audio.ogg" : "audio.webm");
   // The chosen language is a hint; the server double-checks it against auto-detection
   fd.append("language", languageEl.value);
   try {

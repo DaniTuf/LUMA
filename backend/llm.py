@@ -50,7 +50,20 @@ NOTES_MODE_RULES = (
 )
 
 
-def build_system_prompt(level: str, language: str, subject: str = "", voice_mode: bool = False, notes_mode: bool = False) -> str:
+def lesson_rules(language: str) -> str:
+    """The same spoken-teacher style the Live voice uses, for the normal (non-Live) voice: this text is only spoken, never shown."""
+    from .live import SPOKEN_STYLE, TEACHER_INSTRUCTION      # imported here: live.py imports this module
+    return (
+        "SPOKEN LESSON MODE: write the exact words the teacher will SAY aloud; a text-to-speech voice will read your output as-is and the "
+        "student does not see it. Plain sentences only: no Markdown, no lists, no headings, no tables, no code, no symbols; say formulas "
+        "in words. " + SPOKEN_STYLE.get(language, SPOKEN_STYLE["en"]) + " "
+        + TEACHER_INSTRUCTION.replace("LIVE TEACHER MODE. You are a gifted university teacher in a live voice conversation with ONE student.",
+                                      "You are a gifted university teacher talking with ONE student.")
+    )
+
+
+def build_system_prompt(level: str, language: str, subject: str = "", voice_mode: bool = False, notes_mode: bool = False,
+                        lesson_mode: bool = False) -> str:
     level_instruction = LEVEL_INSTRUCTIONS.get(level, LEVEL_INSTRUCTIONS["undergraduate"])
     language_name = LANGUAGE_NAMES.get(language, "English")
 
@@ -83,7 +96,9 @@ def build_system_prompt(level: str, language: str, subject: str = "", voice_mode
             "When asked for code, give complete, working code without omitting parts."
         )
         
-    if notes_mode:
+    if lesson_mode:
+        prompt += lesson_rules(language)
+    elif notes_mode:
         prompt += NOTES_MODE_RULES + "Keep it complete and academically accurate."
     else:
         prompt += " Keep answers focused, complete and academically accurate. Be concise: avoid long preambles."
@@ -221,8 +236,8 @@ def _cooldown_seconds(err_str: str) -> int:
     return 30
 
 async def stream_tutor_reply(message: str, level: str, language: str, history: list[dict], subject: str = "", voice_mode: bool = False,
-                             notes_mode: bool = False):
-    system_prompt = build_system_prompt(level, language, subject, voice_mode, notes_mode)
+                             notes_mode: bool = False, lesson_mode: bool = False):
+    system_prompt = build_system_prompt(level, language, subject, voice_mode, notes_mode, lesson_mode)
     
     available = {}
     if config.GEMINI_API_KEY: available["gemini"] = config.MAX_TOKENS_PER_RESPONSE
