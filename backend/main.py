@@ -33,15 +33,9 @@ class ChatRequest(BaseModel):
     notes_mode: bool = False      # written notes only: the spoken lesson comes separately from /api/lesson
     language: str = "en"
 
-CACHE_GENERATION = "3"      # bump to make every browser drop its cached copy of the app once
-
-
 @app.get("/api/config")
-def get_public_config(request: Request, response: Response):
-    # Browsers that still hold the old page/app.js (it used to be cached for a year) flush their cache ONCE, via this call.
-    if request.cookies.get("luma_cv") != CACHE_GENERATION:
-        response.headers["Clear-Site-Data"] = '"cache"'
-        response.set_cookie("luma_cv", CACHE_GENERATION, max_age=365 * 86400, samesite="lax")
+def get_public_config():
+    # No Clear-Site-Data here any more: on phones and in-app browsers that refuse the cookie it made the page reload in a loop (blank screen).
     return {
         "languages": config.SUPPORTED_LANGUAGES,
         "rtl_languages": list(config.RTL_LANGUAGES),

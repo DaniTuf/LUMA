@@ -15,11 +15,13 @@
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Nastaliq+Urdu:wght@400..700&family=Noto+Naskh+Arabic:wght@400..700&display=swap">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+<!-- Fonts load without blocking the page; the libraries are served by LUMA itself (some networks block public CDNs,
+     which left the page blank). -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Nastaliq+Urdu:wght@400..700&family=Noto+Naskh+Arabic:wght@400..700&display=swap" media="print" onload="this.media='all'">
+<link rel="stylesheet" href="/vendor/katex/katex.min.css">
+<script defer src="/vendor/katex/katex.min.js"></script>
+<script defer src="/vendor/katex/contrib/auto-render.min.js"></script>
+<script src="/vendor/marked.min.js"></script>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -84,6 +86,7 @@
           <option value="ur">اردو (Urdu)</option>
           <option value="ar">العربية (Arabic)</option>
           <option value="fa">فارسی (Persian)</option>
+          <option value="de">Deutsch (German)</option>
         </select>
       </label>
 
@@ -148,7 +151,7 @@
       <div id="empty" class="empty">
         <div class="empty-logo" aria-hidden="true"><img src="assets/tuf-logo-mark.png" alt=""></div>
         <h2>Hi, I'm LUMA. What would you like to learn today?</h2>
-        <p>Ask about any subject or course, in English, Urdu, Arabic or Persian. Type, or tap the microphone to speak.</p>
+        <p>Ask about any subject or course, in English, Urdu, Arabic, Persian or German. Type, or tap the microphone to speak.</p>
         <div class="chips">
           <button type="button" class="chip">Explain the Pythagorean theorem simply</button>
           <button type="button" class="chip">What is supply and demand?</button>
@@ -192,6 +195,7 @@
           <option value="ur">اردو</option>
           <option value="ar">عربي</option>
           <option value="fa">فارسی</option>
+          <option value="de">DE</option>
         </select>
 
         <button type="button" id="mic" class="mic" aria-label="Speak your question" title="Speak">

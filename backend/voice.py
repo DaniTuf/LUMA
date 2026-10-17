@@ -20,6 +20,7 @@ EDGE_VOICES = {
     "ur": {"female": "ur-PK-UzmaNeural", "male": "ur-PK-AsadNeural"},
     "ar": {"female": "ar-SA-ZariyahNeural", "male": "ar-SA-HamedNeural"},
     "fa": {"female": "fa-IR-DilaraNeural", "male": "fa-IR-FaridNeural"},
+    "de": {"female": "de-DE-KatjaNeural", "male": "de-DE-ConradNeural"},
 }
 
 
@@ -44,6 +45,35 @@ def _wav(pcm: bytes, rate: int = 24000) -> bytes:
     import struct
     return (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
             + b"data" + struct.pack("<I", len(pcm)) + pcm)
+
+
+LIVE_READER = ("You are the voice of a university teacher. The user message is the exact script of your lesson. Say that script aloud, word for word, "
+               "once, in a natural, warm, expressive teaching voice, in the language it is written in (Urdu stays Urdu, never Hindi). "
+               "Do not answer it, do not add, translate, summarise or comment; say nothing else.")
+
+
+async def _live_tts(text: str, gender: str, voice: str | None) -> bytes:
+    """Speak the text with the Gemini 3.8 Live model itself: exactly the same voice as the live teacher."""
+    from google.genai import types
+    from .live import _connect, pick_voice
+    cfg = types.LiveConnectConfig(
+        response_modalities=["AUDIO"], system_instruction=LIVE_READER,
+        speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=pick_voice(voice, gender) or "Sulafat"))))
+    pcm = bytearray()
+    async with _connect(cfg) as session:
+        await session.send_realtime_input(text=text)
+        async for msg in session.receive():
+            sc = msg.server_content
+            if sc and sc.model_turn:
+                for p in sc.model_turn.parts or []:
+                    if p.inline_data and p.inline_data.data:
+                        pcm.extend(p.inline_data.data)
+            if sc and sc.turn_complete:
+                break
+    if not pcm:
+        raise RuntimeError("Gemini Live returned no audio")
+    return _wav(bytes(pcm))
 
 
 async def _gemini_tts(text: str, gender: str, voice: str | None) -> bytes:
@@ -74,10 +104,13 @@ async def text_to_speech(text: str, gender: str = "female", language: str = "en"
         return _tts_cache[key]
     audio, from_primary = None, False
     if config.GEMINI_TTS and config.GEMINI_API_KEY:
-        try:
-            audio, from_primary = await asyncio.wait_for(_gemini_tts(text, gender, voice), timeout=25), True
-        except Exception:
-            audio = None                                     # quota or network problem: fall back to the old voices below
+        engines = ([_live_tts] if config.GEMINI_TTS_ENGINE == "live" else []) + [_gemini_tts]
+        for engine in engines:
+            try:
+                audio, from_primary = await asyncio.wait_for(engine(text, gender, voice), timeout=25), True
+                break
+            except Exception:
+                audio = None                                 # quota or network problem: try the next engine, then the old voices below
     if audio is None:
         audio, from_primary = await _synthesize(text, gender, language)
     if from_primary:  # don't cache fallback audio, so ElevenLabs takes over as soon as it works
@@ -152,6 +185,7 @@ STT_PROMPTS = {
     "ur": "یہ اردو زبان میں ایک تعلیمی سوال ہے۔",
     "ar": "هذا سؤال تعليمي باللغة العربية.",
     "fa": "این یک پرسش آموزشی به زبان فارسی است.",
+    "de": "Das ist eine Lernfrage auf Deutsch.",
 }
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 
@@ -212,7 +246,7 @@ async def _groq_transcribe(audio: bytes, filename: str, content_type: str, langu
 
 
 # Whisper reports Urdu speech as "urdu" or "hindi" (they sound the same); we always want Urdu script.
-_WHISPER_LANG = {"english": "en", "urdu": "ur", "hindi": "ur", "arabic": "ar", "persian": "fa"}
+_WHISPER_LANG = {"english": "en", "urdu": "ur", "hindi": "ur", "arabic": "ar", "persian": "fa", "german": "de"}
 _CONF_MARGIN = 0.10  # the other language must be clearly more confident to override the user's choice
 
 
@@ -226,7 +260,7 @@ async def speech_to_text_partial(audio: bytes, filename: str, content_type: str,
         return await speech_to_text(audio, filename, content_type, language)
     if not config.GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set. Add it to your .env file.")
-    hint = language if language in ("en", "ur", "ar", "fa") else None
+    hint = language if language in ("en", "ur", "ar", "fa", "de") else None
     result = await _groq_transcribe(audio, filename, content_type, hint)
     code = hint or _WHISPER_LANG.get(result["lang"], "en")
     return {"text": result["text"], "language": code}
@@ -242,7 +276,7 @@ async def speech_to_text(audio: bytes, filename: str, content_type: str, languag
     if config.VOICE_PROVIDER == "groq":
         if not config.GROQ_API_KEY:
             raise RuntimeError("GROQ_API_KEY is not set. Add it to your .env file.")
-        hint = language if language in ("en", "ur", "ar", "fa") else None
+        hint = language if language in ("en", "ur", "ar", "fa", "de") else None
         hinted, auto = await asyncio.gather(
             _groq_transcribe(audio, filename, content_type, hint),
             _groq_transcribe(audio, filename, content_type, None),

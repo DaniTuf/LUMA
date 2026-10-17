@@ -164,7 +164,7 @@ def test_live_config_is_voice_only_and_follows_gemini_3_8_rules():
     assert cfg.response_modalities == ["AUDIO"]
     assert cfg.input_audio_transcription is not None and cfg.output_audio_transcription is not None
     assert not cfg.tools, "the voice must have NO tools: it can never see or write the notes"
-    assert list(cfg.input_audio_transcription.language_codes) == ["ur-PK", "ar-SA", "fa-IR", "en-US"], "Urdu speech must not be transcribed as Hindi"
+    assert list(cfg.input_audio_transcription.language_codes) == ["ur-PK", "ar-SA", "fa-IR", "en-US", "de-DE"], "Urdu speech must not be transcribed as Hindi"
     assert cfg.thinking_config is None and not cfg.enable_affective_dialog and cfg.proactivity is None
     assert cfg.speech_config.voice_config.prebuilt_voice_config.voice_name == "Sulafat"
     assert config.LIVE_MODEL == "gemini-3.8-live"
@@ -643,12 +643,12 @@ def test_preview_failure_is_generic(client, monkeypatch):
     assert r.status_code == 502 and "test-key-not-real" not in r.text
 
 
-def test_old_browser_caches_are_flushed_exactly_once():
+def test_config_never_asks_the_browser_to_clear_its_cache():
+    """Real bug: Clear-Site-Data on /api/config made phones and in-app browsers that refuse the cookie reload the page forever (blank screen)."""
     c = TestClient(app)
-    first = c.get("/api/config")
-    assert first.headers.get("clear-site-data") == '"cache"' and "luma_cv" in first.cookies
-    second = c.get("/api/config")
-    assert "clear-site-data" not in second.headers, "must not wipe the cache on every page load"
+    for _ in range(3):
+        r = c.get("/api/config")
+        assert "clear-site-data" not in r.headers and "luma_cv" not in r.cookies
 
 
 # ------------------------------------------------------------------ language follows the question (not only the selector)
@@ -664,6 +664,12 @@ URDU_Q = "کمپیوٹر میں ریکرشن کیا ہوتی ہے؟ آسان ا�
     ("بازگشت در برنامه نویسی چیست؟ چگونه کار می کند", "en", "fa"),
     ("بازگشت در برنامه نویسی چیست؟ چگونه کار می کند", "ur", "ur"),
     ("", "ur", "ur"),
+    ("Erkläre mir bitte, wie Rekursion funktioniert.", "en", "de"),      # German question, selector says English
+    ("Was ist der Unterschied zwischen einem Array und einer Liste?", "en", "de"),
+    ("What is the difference between an array and a list?", "de", "en"), # English question, selector says German
+    ("Rekursion", "de", "de"),                                           # too short to tell: keeps the selector
+    ("Rekursion", "en", "en"),
+    ("Was ist Rekursion?", "ur", "ur"),                                  # other selectors are left alone (Roman Urdu etc.)
 ])
 def test_detect_language(text, default, expected):
     assert live.detect_language(text, default) == expected

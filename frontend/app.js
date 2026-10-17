@@ -34,6 +34,7 @@ function normalizeMath(text) {
 }
 
 function renderInto(el, text) {
+  if (!window.marked) { el.textContent = text || ""; return; } // library failed to load: still show the answer
   el.innerHTML = marked.parse(normalizeMath(text || ""));
   if (window.renderMathInElement) renderMathInElement(el, { delimiters: MATH_DELIMS });
 }
@@ -166,6 +167,21 @@ function addContinueButton(body) {
   body.appendChild(btn);
 }
 
+const GERMAN_WORDS = new Set("der die das den dem des und ist nicht ich du wir sie er es ein eine einen einem einer zu mit auf für von im am an wie was warum wann wo wer welche welcher kann können bitte erkläre erklären erklär mir mich uns wird werden sind sein hat haben oder aber auch noch nur dass wenn dann also kurz einfach beispiel bedeutet unterschied".split(" "));
+const ENGLISH_WORDS = new Set("the and is are not you your we they it a an of to in on for with how what why when where who which can could please explain me my us be been has have or but also only that if then so simply example means difference does do".split(" "));
+
+// German or English for Latin-script text; null = too short to tell (keep the selector). Only when the selector is English or German.
+function latinLanguage(text) {
+  if (!["en", "de"].includes(languageEl.value)) return null;
+  const words = text.toLowerCase().match(/[a-zäöüß]+/g) || [];
+  const de = words.filter((w) => GERMAN_WORDS.has(w)).length;
+  const en = words.filter((w) => ENGLISH_WORDS.has(w)).length;
+  if (/[äöüß]/i.test(text) && de >= en) return "de";
+  if (de >= 2 && de > en) return "de";
+  if (en >= 2 && en > de) return "en";
+  return null;
+}
+
 // Guess the language from the script of the student's message (null = can't tell / Latin).
 function detectLanguage(text) {
   // Hindi script (Devanagari) = a Hindustani question; LUMA answers it in Urdu
@@ -173,7 +189,7 @@ function detectLanguage(text) {
   if (devanagari && devanagari >= (text.match(/[A-Za-z]/g) || []).length) return "ur";
   const arabicScript = (text.match(/[؀-ۿ]/g) || []).length;
   const latin = (text.match(/[A-Za-z]/g) || []).length;
-  if (arabicScript === 0 || arabicScript < latin) return null;
+  if (arabicScript === 0 || arabicScript < latin) return latin ? latinLanguage(text) : null;
   if (/[ٹڈڑںےہھ]/.test(text)) return "ur";
   if (/[ژی]/.test(text) && /[پچگ]/.test(text) && !/[ىي]/.test(text)) {
     return languageEl.value === "ur" ? "ur" : "fa";
@@ -436,6 +452,7 @@ function resetSpeechQueue() {
   spokenRawLen = 0;
   pendingSpeechText = "";
   firstChunkSent = false;
+  chunksQueued = 0;
 }
 
 // The end of the raw text that's safe to read: cuts off before any code fence / $$ / \[..\]
@@ -505,7 +522,11 @@ function flushSpeechQueue(finalShownText) {
 // like numbered-list markers ("1.") and abbreviations ("e.g.") each end a "sentence" and
 // would fire off a separate one-word TTS request, sounding choppy and hammering the free
 // voice service. The very first chunk is exempt so speech still starts immediately.
-const MIN_CHUNK = 170; // the Gemini voice makes whole phrases at once, so longer chunks sound smoother (fewer joins)
+// The Gemini voice makes a phrase in about as long as it takes to say, and all chunks are requested at once. So the first chunk is
+// short (starts quickly) and each next one is longer: it is ready just before the previous one finishes playing, with few joins.
+const CHUNK_STEPS = [45, 90, 150, 230, 320];
+let chunksQueued = 0;
+const chunkNeed = (i) => CHUNK_STEPS[Math.min(i, CHUNK_STEPS.length - 1)];
 // Don't wait for the model's first full sentence before speaking anything — a long first
 // clause with no punctuation yet would mean several seconds of dead air. Once this many
 // characters have piled up, cut at the last word boundary and speak that fragment right
@@ -542,7 +563,7 @@ function drainCompleteSentences(isFinal) {
   let cur = "";
   for (const part of usable) {
     cur += part;
-    if (cur.trim().length >= (firstChunkSent ? MIN_CHUNK : FIRST_CHUNK_MIN)) {
+    if (cur.trim().length >= chunkNeed(chunksQueued + ready.length)) {
       ready.push(cur);
       firstChunkSent = true;
       cur = "";
@@ -617,6 +638,7 @@ let speechSeq = 0;
 function enqueueSpeech(text) {
   const token = speakToken;
   const label = `#${++speechSeq}`;
+  chunksQueued++;
   const job = { token, label, promise: fetchSpeech(text, label) };
   job.promise.catch(() => {});
   speechQueue.push(job);

@@ -69,6 +69,10 @@ SPOKEN_STYLE = {
            "not a printed textbook), using technical terms as they are normally used in lectures."),
     "fa": ("Speak natural, warm, spoken Persian (محاوره‌ای, the way a friendly university lecturer talks in class, "
            "not the language of a printed book), using technical terms as they are normally used in lectures."),
+    "de": ("Sprich natürliches, warmes, gesprochenes Hochdeutsch, so wie eine freundliche Dozentin oder ein Dozent an der Universität "
+           "laut denkend erklärt: kurze und längere Sätze im Wechsel, direkte Ansprache (Sie), verständliche Alltagsbeispiele. "
+           "Verwende Fachbegriffe so, wie sie in Vorlesungen üblich sind (englische Fachwörter dürfen bleiben, wenn man sie in "
+           "Deutschland so sagt). Kein Schriftdeutsch wie in einem Gesetzestext, und niemals auf Englisch antworten, wenn Deutsch gefragt wurde."),
 }
 
 TEACHER_INSTRUCTION = (
@@ -102,8 +106,8 @@ def build_live_prompt(level: str, language: str, subject: str = "") -> str:
         + SCOPE_RULES + " " + IDENTITY_RULES
         + (f"The student's current subject is: {subject}. " if subject else "")
         + LEVEL_INSTRUCTIONS.get(level, LEVEL_INSTRUCTIONS["undergraduate"]) + " "
-        + f"LANGUAGE: always answer in the language the student used in their latest message or spoke (English, Urdu, Arabic or Persian); "
-          f"if it is unclear, use {lang}. Never answer in English to a question asked in Urdu, Arabic or Persian. "
+        + f"LANGUAGE: always answer in the language the student used in their latest message or spoke (English, Urdu, Arabic, Persian or German); "
+          f"if it is unclear, use {lang}. Never answer in English to a question asked in Urdu, Arabic, Persian or German. "
         + "HINDI VS URDU: spoken Urdu and Hindi sound alike, but this is a Pakistani university and the language is URDU. When the student speaks "
           "or writes Hindustani, Urdu or Hindi, ALWAYS answer in URDU: Urdu vocabulary and Urdu script in your transcript, never Hindi/Sanskrit words "
           "(say شکریہ، مسئلہ، براہ مہربانی، مطلب، ضرور; never धन्यवाद، समस्या، कृपया) and never Devanagari. If the student asks you to speak Urdu or says "
@@ -122,6 +126,27 @@ _PERSIAN_LETTERS = re.compile(r"[\u067E\u0686\u06AF]")                          
 _ARABIC_YEH = re.compile(r"[\u0649\u064A]")                                          # ى ي
 
 
+_GERMAN_WORDS = frozenset("der die das den dem des und ist nicht ich du wir sie er es ein eine einen einem einer zu mit auf für von im am an wie was warum "
+                          "wann wo wer welche welcher kann können bitte erkläre erklären erklär mir mich uns wird werden sind sein hat haben "
+                          "oder aber auch noch nur dass wenn dann also kurz einfach beispiel bedeutet unterschied".split())
+_ENGLISH_WORDS = frozenset("the and is are not you your we they it a an of to in on for with how what why when where who which can could please explain "
+                           "me my us be been has have or but also only that if then so simply example means difference does do".split())
+
+
+def latin_language(text: str, default: str) -> str:
+    """German or English for Latin-script text (the selector only says which one to prefer when the text is too short to tell)."""
+    words = re.findall(r"[a-zäöüß]+", text.lower())
+    de, en = sum(w in _GERMAN_WORDS for w in words), sum(w in _ENGLISH_WORDS for w in words)
+    umlaut = bool(re.search(r"[äöüß]", text.lower()))
+    if umlaut and de >= en:
+        return "de"
+    if de >= 2 and de > en:
+        return "de"
+    if en >= 2 and en > de:
+        return "en"
+    return default
+
+
 def detect_language(text: str, default: str = "en") -> str:
     """The language of what the student wrote or said. Arabic-script text is Urdu / Persian / Arabic; Latin script keeps the selected
     language (same behaviour as the normal chat). Fixes: asking in Urdu while the selector said English got an English answer."""
@@ -132,7 +157,10 @@ def detect_language(text: str, default: str = "en") -> str:
         return "ur"
     arabic, latin = len(_ARABIC_SCRIPT.findall(text)), len(_LATIN.findall(text))
     if arabic == 0 or arabic < latin:
-        return default if default in config.SUPPORTED_LANGUAGES else "en"
+        base = default if default in config.SUPPORTED_LANGUAGES else "en"
+        if base in ("en", "de") and latin:
+            return latin_language(text, base)
+        return base
     if _URDU_ONLY.search(text):
         return "ur"
     if _PERSIAN_HINT.search(text) and _PERSIAN_LETTERS.search(text) and not _ARABIC_YEH.search(text):
@@ -177,6 +205,9 @@ TEACH_NOTES = {
            "قدم بہ قدم، عام غلطی اور اس کی اہمیت۔ اردو رسم الخط میں بولیں، نوٹس نہ پڑھیں۔]"),
     "ar": ("\n\n[ملاحظة للمعلّم: اشرح هذا الموضوع جيدًا في دقيقتين إلى ثلاث دقائق: صورة أو قصة، ومثال محلول بأرقام حقيقية خطوة بخطوة، "
            "والخطأ الشائع وأهميته. تحدّث ولا تقرأ الملاحظات.]"),
+    "de": ("\n\n[Hinweis für die Lehrkraft: Erkläre das gründlich, etwa zwei bis drei Minuten lang: ein Bild oder eine kleine Geschichte, "
+           "ein durchgerechnetes Beispiel mit echten Zahlen Schritt für Schritt, der typische Fehler und warum er wichtig ist. "
+           "Sprich auf Deutsch und lies keine Notizen vor.]"),
     "fa": ("\n\n[یادداشت برای معلم: این موضوع را در دو تا سه دقیقه به‌خوبی درس بدهید: یک تصویر یا داستان، یک مثال حل‌شده با اعداد واقعی "
            "گام‌به‌گام، اشتباه رایج و اهمیت آن. صحبت کنید و یادداشت‌ها را نخوانید.]"),
 }
@@ -186,7 +217,7 @@ def teach_note(language: str) -> str:
     return TEACH_NOTES.get(language, TEACH_NOTES["en"])
 
 
-INPUT_LANGUAGES = ("ur-PK", "ar-SA", "fa-IR", "en-US")
+INPUT_LANGUAGES = ("ur-PK", "ar-SA", "fa-IR", "en-US", "de-DE")
 
 INTERRUPT_NOTE = "(The student pressed Stop. Stop teaching now. Reply with just the word Okay and wait for their next question.)"
 
@@ -589,6 +620,8 @@ PREVIEW_TEXT = {
            "A hash table is like a magic librarian who points you to the exact shelf in a single step."),
     "ur": ("فرض کریں آپ ایک بہت بڑی لائبریری میں ایک کتاب ڈھونڈ رہے ہیں۔ اگر کوئی فہرست نہ ہو تو آپ کو ہر شیلف دیکھنی پڑے گی۔ "
            "ہیش ٹیبل ایک ایسے لائبریرین کی طرح ہے جو آپ کو ایک ہی قدم میں صحیح شیلف بتا دیتا ہے۔"),
+    "de": ("Stell dir vor, du suchst ein einziges Buch in einer riesigen Bibliothek. Ohne Verzeichnis müsstest du jedes Regal durchsuchen. "
+           "Eine Hashtabelle ist wie ein magischer Bibliothekar, der dich in einem einzigen Schritt zum richtigen Regal führt."),
     "ar": ("تخيّل أنك تبحث عن كتاب واحد في مكتبة ضخمة. من دون فهرس ستضطر إلى تفتيش كل رفّ. "
            "جدول التجزئة مثل أمين مكتبة سحري يدلّك على الرفّ الصحيح في خطوة واحدة."),
     "fa": ("تصور کنید در یک کتابخانهٔ بزرگ دنبال یک کتاب می‌گردید. بدون فهرست باید همهٔ قفسه‌ها را بگردید. "

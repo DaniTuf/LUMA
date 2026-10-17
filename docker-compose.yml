@@ -25,6 +25,11 @@ services:
     container_name: luma_ui
     ports:
       - "8080:80"
+      - "${HTTPS_PORT:-8443}:443"      # https (set HTTPS_PORT=443 in .env to use the standard port)
+    environment:
+      LUMA_HOSTS: ${LUMA_HOSTS:-localhost,127.0.0.1}      # addresses the self-signed certificate is made for
+    volumes:
+      - ./certs:/certs
     depends_on:
       - luma_backend
     restart: unless-stopped

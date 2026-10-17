@@ -9,3 +9,4 @@ data/
 *.pyc
 .venv/
 node_modules/
+certs/

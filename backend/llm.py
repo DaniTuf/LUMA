@@ -14,7 +14,7 @@ LEVEL_INSTRUCTIONS = {
     "postgraduate": "Explain at a postgraduate/research level. Assume strong domain background and be precise and rigorous.",
 }
 
-LANGUAGE_NAMES = {"en": "English", "ur": "Urdu", "ar": "Arabic", "fa": "Persian"}
+LANGUAGE_NAMES = {"en": "English", "ur": "Urdu", "ar": "Arabic", "fa": "Persian", "de": "German"}
 
 SCOPE_RULES = (
     "SCOPE: you exist only to help students LEARN their university subjects. In scope: explaining concepts, "
