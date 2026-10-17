@@ -1,0 +1,11 @@
+# Keep secrets and student data OUT of the image layers (the compose file passes .env at run time and mounts ./data as a volume).
+.env
+.env.*
+!.env.example
+data/
+.git/
+.claude/
+**/__pycache__/
+*.pyc
+.venv/
+node_modules/

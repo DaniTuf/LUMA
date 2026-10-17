@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydantic
+itsdangerous
+httpx
+edge-tts
+python-dotenv
+google-auth
+google-genai
+anthropic
+openai
+python-multipart

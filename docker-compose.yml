@@ -1,0 +1,36 @@
+services:
+  luma_backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      network: host
+    container_name: luma_api
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    networks:
+      - luma_network
+
+  luma_frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: luma_ui
+    ports:
+      - "8080:80"
+    depends_on:
+      - luma_backend
+    restart: unless-stopped
+    networks:
+      - luma_network
+
+networks:
+  luma_network:
+    driver: bridge

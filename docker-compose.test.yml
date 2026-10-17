@@ -1,0 +1,46 @@
+# Side-by-side TEST stack: never touches the running LUMA containers, ports or data.
+#   docker compose -p luma_test -f docker-compose.test.yml up -d --build
+#   open http://localhost:8081      (API on :8001)       tear down: docker compose -p luma_test -f docker-compose.test.yml down -v
+# Uses the same .env (keys) at run time, an EMPTY database in its own named volume, and dev sign-in for testing.
+name: luma_test
+services:
+  luma_backend:                     # service name stays "luma_backend" because frontend/nginx.conf proxies to that host name
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      network: host
+    container_name: luma_api_test
+    env_file:
+      - .env
+    environment:
+      DEV_LOGIN: "1"
+      MAX_MESSAGES_PER_USER_PER_DAY: "500"
+      DB_PATH: /app/data/luma.db
+    volumes:
+      - luma_test_data:/app/data
+    ports:
+      - "8001:8000"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    networks:
+      - luma_network
+
+  luma_frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: luma_ui_test
+    ports:
+      - "8081:80"
+    depends_on:
+      - luma_backend
+    networks:
+      - luma_network
+
+volumes:
+  luma_test_data:
+
+networks:
+  luma_network:
+    driver: bridge
