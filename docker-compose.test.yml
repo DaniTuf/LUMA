@@ -1,9 +1,36 @@
-# Side-by-side TEST stack: never touches the running LUMA containers, ports or data.
+﻿# Side-by-side TEST stack: never touches the running LUMA containers, ports or data.
 #   docker compose -p luma_test -f docker-compose.test.yml up -d --build
 #   open http://localhost:8081      (API on :8001)       tear down: docker compose -p luma_test -f docker-compose.test.yml down -v
 # Uses the same .env (keys) at run time, an EMPTY database in its own named volume, and dev sign-in for testing.
 name: luma_test
 services:
+  luma_postgres:                    # its own database: the test stack never touches the real data
+    image: postgres:16-alpine
+    container_name: luma_postgres_test
+    environment:
+      POSTGRES_USER: luma
+      POSTGRES_PASSWORD: luma_test
+      POSTGRES_DB: luma
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U luma -d luma"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - luma_network
+
+  luma_redis:                       # its own Redis: the test stack never shares state with the running LUMA
+    image: redis:7-alpine
+    container_name: luma_redis_test
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - luma_network
+
   luma_backend:                     # service name stays "luma_backend" because frontend/nginx.conf proxies to that host name
     build:
       context: .
@@ -15,7 +42,14 @@ services:
     environment:
       DEV_LOGIN: "1"
       MAX_MESSAGES_PER_USER_PER_DAY: "500"
-      DB_PATH: /app/data/luma.db
+      DATABASE_URL: postgresql+asyncpg://luma:luma_test@luma_postgres:5432/luma
+      WEB_CONCURRENCY: "2"
+      REDIS_URL: redis://luma_redis:6379/0
+    depends_on:
+      luma_postgres:
+        condition: service_healthy
+      luma_redis:
+        condition: service_healthy
     volumes:
       - luma_test_data:/app/data
     ports:
@@ -44,3 +78,4 @@ volumes:
 networks:
   luma_network:
     driver: bridge
+

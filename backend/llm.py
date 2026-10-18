@@ -1,12 +1,14 @@
 import asyncio
 import logging
-import time
+import random
 from google import genai
 from google.genai import types
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
-from . import config, curriculum
+from . import config, curriculum, langpolicy, state
+
+log = logging.getLogger("luma.llm")
 
 LEVEL_INSTRUCTIONS = {
     "foundation": "Explain in simple terms suitable for a foundation-year student. Avoid jargon, use everyday analogies, and break steps down clearly.",
@@ -52,12 +54,12 @@ NOTES_MODE_RULES = (
 
 def lesson_rules(language: str) -> str:
     """The same spoken-teacher style the Live voice uses, for the normal (non-Live) voice: this text is only spoken, never shown."""
-    from .live import SPOKEN_STYLE, TEACHER_INSTRUCTION      # imported here: live.py imports this module
+    from .live import SPOKEN_STYLE, SPOKEN_TEACHER_INSTRUCTION      # imported here: live.py imports this module
     return (
         "SPOKEN LESSON MODE: write the exact words the teacher will SAY aloud; a text-to-speech voice will read your output as-is and the "
         "student does not see it. Plain sentences only: no Markdown, no lists, no headings, no tables, no code, no symbols; say formulas "
         "in words. " + SPOKEN_STYLE.get(language, SPOKEN_STYLE["en"]) + " "
-        + TEACHER_INSTRUCTION.replace("LIVE TEACHER MODE. You are a gifted university teacher in a live voice conversation with ONE student.",
+        + SPOKEN_TEACHER_INSTRUCTION.replace("LIVE TEACHER MODE. You are a gifted university teacher in a live voice conversation with ONE student.",
                                       "You are a gifted university teacher talking with ONE student.")
     )
 
@@ -77,10 +79,7 @@ def build_system_prompt(level: str, language: str, subject: str = "", voice_mode
         + f"{level_instruction} "
     )
     
-    prompt += (
-        f"LANGUAGE: You MUST reply strictly in {language_name}. "
-        "Do not use any other language, even if the user writes in a different language. "
-    )
+    prompt += langpolicy.directive(language) + "Do not switch language unless the student explicitly asks you to answer in another language. "
     
     if voice_mode:
         prompt += (
@@ -223,90 +222,112 @@ async def _stream_claude(system_prompt: str, message: str, history: list[dict], 
     if final.stop_reason == "max_tokens": yield TRUNCATED_MARK
 
 # ---------- Main Fallback Orchestrator ----------
+# Retry the SAME provider once for a transient error, then fail over to the next provider. If a provider dies HALFWAY through an
+# answer, the next one is told to CONTINUE from the text already produced (it never restarts and never repeats what the student has seen).
+# Every failure and what was done about it goes to the failure log (Redis stream) with the key scrubbed out.
 
-# A provider that just failed is skipped for a while, so later messages don't each
-# pay for a doomed request before reaching a provider that works.
-_cooldown_until: dict[str, float] = {}
+class LLMUnavailable(Exception):
+    """Every configured provider failed (details are in the failure log, not in this message)."""
+
+
+_BILLING = ("credit balance", "billing", "insufficient", "payment", "api key", "api_key", "permission", "unauthenticated", "401", "403")
+_RATE = ("429", "rate limit", "tokens per minute", "quota", "resource_exhausted")
+STALL_TIMEOUT = 20.0          # seconds without a new chunk in the middle of an answer = the provider has hung
+
 
 def _cooldown_seconds(err_str: str) -> int:
-    if any(k in err_str for k in ("credit balance", "billing", "insufficient")):
+    if any(k in err_str for k in _BILLING):
         return 900
-    if any(k in err_str for k in ("429", "rate limit", "tokens per minute", "quota")):
+    if any(k in err_str for k in _RATE):
         return 60
     return 30
 
+
+CONTINUE_BLOCK = (
+    "CONTINUATION: a previous writer already produced the beginning of this answer and then failed. The text so far is between <<< and >>>. "
+    "Continue EXACTLY where it stops: same language, same format, same numbering. Do not repeat or summarise it, do not restart, do not add a "
+    "new title, and do not mention the interruption. Output only the continuation.\n<<<\n{tail}\n>>>"
+)
+
+
+async def _provider_stream(provider: str, system_prompt: str, message: str, history: list[dict], max_tok: int, language: str):
+    if provider == "groq":
+        budget = config.GROQ_TPM_LIMIT - max_tok - 300
+        trimmed = _trim_history_to_budget(system_prompt, message, history, max(budget, 500), language)
+        async for chunk in _stream_groq(system_prompt, message, trimmed, max_tok):
+            yield chunk
+    elif provider == "gemini":
+        async for chunk in _stream_gemini(system_prompt, message, history[-20:], max_tok):
+            yield chunk
+    else:
+        async for chunk in _stream_claude(system_prompt, message, history[-20:], max_tok):
+            yield chunk
+
+
 async def stream_tutor_reply(message: str, level: str, language: str, history: list[dict], subject: str = "", voice_mode: bool = False,
-                             notes_mode: bool = False, lesson_mode: bool = False):
-    system_prompt = build_system_prompt(level, language, subject, voice_mode, notes_mode, lesson_mode)
-    
+                             notes_mode: bool = False, lesson_mode: bool = False, extra_instructions: str = "", continue_text: str = ""):
+    """Stream the tutor's answer. `extra_instructions` is appended to the system prompt (the judge's advice); `continue_text` is an answer
+    that was already started (by a provider or a worker that died): the model continues it and only the NEW text is yielded."""
     available = {}
     if config.GEMINI_API_KEY: available["gemini"] = config.MAX_TOKENS_PER_RESPONSE
     if config.GROQ_API_KEY: available["groq"] = config.GROQ_MAX_TOKENS_PER_RESPONSE
     if config.ANTHROPIC_API_KEY: available["claude"] = config.MAX_TOKENS_PER_RESPONSE
-
     if not available:
-        print("❌ [LUMA] No LLM API keys configured in environment!", flush=True)
-        yield "[Error: No LLM API keys configured]"
-        return
+        await state.log_failure("llm", "no LLM API keys configured", action="give_up")
+        raise LLMUnavailable("no providers configured")
 
-    # LLM_PROVIDER goes first, the rest are fallbacks
-    order = sorted(available, key=lambda p: p != config.LLM_PROVIDER)
-    now = time.time()
-    ready = [p for p in order if _cooldown_until.get(p, 0) <= now]
-    # Skip providers that just failed; if every one is cooling down, try them all anyway
-    providers = [(p, available[p]) for p in (ready or order)]
+    order = sorted(available, key=lambda p: p != config.LLM_PROVIDER)            # LLM_PROVIDER first, the rest are fallbacks
+    ready = [p for p in order if not await state.in_cooldown(p)]
+    providers = [(p, available[p]) for p in (ready or order)]                     # every provider cooling down: try them all anyway
+    model_names = {"claude": config.CLAUDE_MODEL, "gemini": config.GEMINI_MODEL, "groq": config.GROQ_MODEL}
 
-    model_names = {
-        "claude": config.CLAUDE_MODEL,
-        "gemini": config.GEMINI_MODEL,
-        "groq": config.GROQ_MODEL
-    }
-
-    last_exception = None
+    emitted = ""                       # new text already given to the caller (all providers together)
+    last_error: Exception | None = None
     for provider, max_tok in providers:
-        model_name = model_names.get(provider, "unknown-model")
-        
-        try:
-            # 👇 GUARANTEED DOCKER LOG 👇
-            print(f"🚀 [LUMA] Streaming with: {provider.upper()} (Model: {model_name})", flush=True)
-            
-            if provider == "groq":
-                budget = config.GROQ_TPM_LIMIT - max_tok - 300
-                trimmed = _trim_history_to_budget(system_prompt, message, history, max(budget, 500), language)
-            else:
-                trimmed = history[-20:]
-                
-            if provider == "gemini":
-                async for chunk in _stream_gemini(system_prompt, message, trimmed, max_tok): yield chunk
-            elif provider == "groq":
-                async for chunk in _stream_groq(system_prompt, message, trimmed, max_tok): yield chunk
-            elif provider == "claude":
-                async for chunk in _stream_claude(system_prompt, message, trimmed, max_tok): yield chunk
-                
-            return 
-            
-        except Exception as e:
-            err_str = str(e).lower()
-            # 👇 ADDED BILLING AND QUOTA KEYWORDS HERE 👇
-            fallback_triggers = [
-                "429", "rate limit", "tokens per minute", 
-                "context length", "maximum context length", 
-                "overloaded", "503", "500", "408", "504",
-                "credit balance", "billing", "quota", "insufficient",
-                "timed out", "timeout", "interrupted", "dropped connection", 
-                "cancellation", "canceled", "aborted", "network"
-            ]
-            
-            if any(k in err_str for k in fallback_triggers):
-                cooldown = _cooldown_seconds(err_str)
-                _cooldown_until[provider] = time.time() + cooldown
-                print(f"⚠️ [LUMA] {provider.upper()} hit a limit/error: {e}. Skipping it for {cooldown}s, falling back...", flush=True)
-                last_exception = e
-                continue 
-            else:
-                print(f"❌ [LUMA] {provider.upper()} crashed: {e}", flush=True)
-                yield f"\n\n[Error generating response: {e}]"
-                return
-                
-    print(f"❌ [LUMA] All LLM providers failed. Last error: {last_exception}", flush=True)
-    yield f"\n\n[Error: All LLM providers failed or hit limits. Last error: {last_exception}]"
+        attempt = 0
+        while True:
+            done_text = continue_text + emitted
+            prompt = build_system_prompt(level, language, subject, voice_mode, notes_mode, lesson_mode)
+            if extra_instructions:
+                prompt += " " + extra_instructions
+            if done_text:
+                prompt += "\n\n" + CONTINUE_BLOCK.format(tail=done_text[-1800:])
+            stream = _provider_stream(provider, prompt, message, history, max_tok, language)
+            first = not emitted
+            try:
+                log.info("streaming with %s (%s)%s", provider, model_names.get(provider), " [continuing]" if done_text else "")
+                it = stream.__aiter__()
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(it.__anext__(), config.LLM_FIRST_TOKEN_TIMEOUT if first else STALL_TIMEOUT)
+                    except StopAsyncIteration:
+                        return
+                    first = False
+                    if chunk != TRUNCATED_MARK:
+                        emitted += chunk
+                    yield chunk
+            except (asyncio.CancelledError, GeneratorExit):
+                raise
+            except Exception as exc:
+                exc = type(exc)(f"{type(exc).__name__}: {exc}") if not str(exc) else exc     # never log an empty error
+                last_error = exc
+                err = (str(exc) or type(exc).__name__).lower()
+                billing = any(k in err for k in _BILLING)
+                if attempt < config.LLM_RETRIES and not billing and not any(k in err for k in _RATE):
+                    attempt += 1
+                    await state.log_failure("llm", exc, provider=provider, action="retry_same_provider", attempt=attempt, emitted=len(emitted))
+                    await asyncio.sleep(config.LLM_RETRY_BASE_SECONDS * (2 ** (attempt - 1)) * (0.5 + random.random()))
+                    continue
+                cooldown = _cooldown_seconds(err)
+                await state.set_cooldown(provider, cooldown)
+                await state.log_failure("llm", exc, provider=provider, model=model_names.get(provider),
+                                        action="continue_on_next_provider" if emitted else "failover", cooldown=cooldown, emitted=len(emitted))
+                break
+            finally:
+                try:
+                    await stream.aclose()
+                except Exception:
+                    pass
+
+    await state.log_failure("llm", last_error or "unknown", action="give_up", emitted=len(emitted))
+    raise LLMUnavailable("all providers failed")

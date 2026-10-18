@@ -5,3 +5,10 @@ __pycache__/
 venv/
 data/
 certs/
+
+tests/e2e/.vendor/
+data_backup_*/
+.vscode/
+.pytest_cache/
+*.tgz
+luma-server.env

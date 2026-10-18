@@ -1,0 +1,11 @@
+# Rebuild the web front end WITHOUT contacting Docker Hub: start from the nginx image already on this machine
+# (tagged luma-base-frontend:offline, see docker-compose.offline.yml); the math/markdown libraries are already inside it.
+FROM luma-base-frontend:offline
+
+COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
+COPY frontend/luma-common.conf /etc/nginx/luma-common.conf
+COPY frontend/40-luma-cert.sh /docker-entrypoint.d/40-luma-cert.sh
+RUN sed -i 's/\r$//' /docker-entrypoint.d/40-luma-cert.sh /etc/nginx/luma-common.conf /etc/nginx/conf.d/default.conf && \
+    chmod +x /docker-entrypoint.d/40-luma-cert.sh
+COPY frontend/index.html frontend/style.css frontend/app.js /usr/share/nginx/html/
+COPY frontend/assets /usr/share/nginx/html/assets

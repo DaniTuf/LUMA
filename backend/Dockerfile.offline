@@ -1,0 +1,17 @@
+﻿# Rebuild the backend WITHOUT contacting Docker Hub / ghcr.io (they were unreachable: Docker Desktop DNS problem).
+# It starts from the backend image that is already on this machine (tagged luma-base-backend:offline, see docker-compose.offline.yml)
+# and only adds the new Python packages (pip uses the host network) and the new code.
+FROM luma-base-backend:offline
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+RUN mkdir -p /app/data
+
+EXPOSE 8000
+
+# several worker processes: state that must be shared lives in Postgres and Redis, never in the process (see backend/db.py, backend/state.py)
+CMD ["sh", "-c", "exec uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers ${WEB_CONCURRENCY:-2} --proxy-headers --forwarded-allow-ips='*'"]
+

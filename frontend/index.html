@@ -2,10 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <title>LUMA — Learning &amp; University Mentor Assistant</title>
 <link rel="icon" type="image/png" href="assets/favicon.png" />
-<link rel="stylesheet" href="style.css?v=20261018" />
+<link rel="stylesheet" href="style.css?v=20261022" />
 <script>
   // Applied before first paint so returning users don't see a flash of the wrong theme.
   try {
@@ -184,7 +184,7 @@
           <span id="rec-time">0:00</span>
         </div>
 
-        <button type="button" id="live-toggle" class="live-toggle" hidden aria-pressed="false"
+        <button type="button" id="live-toggle" class="live-toggle" hidden data-state="idle"
                 title="Live teacher: it explains out loud like a lecturer while detailed notes appear on screen">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 10 12 5 2 10l10 5 10-5Z"/><path d="M6 12v5c3 2 9 2 12 0v-5"/></svg>
           <span>Live</span>
@@ -211,6 +211,7 @@
     </div>
   </section>
 </div>
-<script src="app.js?v=20261020"></script>
+<script src="app.js?v=20261022"></script>
 </body>
 </html>
+

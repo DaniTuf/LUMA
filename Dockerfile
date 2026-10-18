@@ -1,9 +1,9 @@
-# One-container LUMA for free cloud hosts (Hugging Face Spaces, Render, Koyeb, ...).
+﻿# One-container LUMA for free cloud hosts (Hugging Face Spaces, Render, Koyeb, ...).
 # The backend serves the web pages itself, so no nginx is needed. API keys come from the host's
 # "secrets / environment variables" settings, never from a file in the image (.env is excluded).
 FROM python:3.12-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PORT=7860 DB_PATH=/app/data/luma.db
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PORT=7860
 WORKDIR /app
 
 COPY requirements.txt .
@@ -31,3 +31,4 @@ USER luma
 
 EXPOSE 7860
 CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT} --proxy-headers --forwarded-allow-ips='*'"]
+

@@ -1,4 +1,4 @@
-const RTL_LANGUAGES = new Set(["ur", "ar", "fa"]);
+﻿const RTL_LANGUAGES = new Set(["ur", "ar", "fa"]);
 const MATH_DELIMS = [
   { left: "$$", right: "$$", display: true },
   { left: "$", right: "$", display: false },
@@ -104,10 +104,14 @@ function applyLanguageDirection() {
   messageEl.lang = languageEl.value;
   voiceLangEl.value = languageEl.value; // keep the mic's language picker in sync
 }
-languageEl.addEventListener("change", applyLanguageDirection);
+languageEl.addEventListener("change", () => {
+  applyLanguageDirection();
+  if (typeof liveSyncLanguage === "function") liveSyncLanguage();
+});
 voiceLangEl.addEventListener("change", () => {
   languageEl.value = voiceLangEl.value;
   applyLanguageDirection();
+  if (typeof liveSyncLanguage === "function") liveSyncLanguage();
 });
 
 document.querySelectorAll(".chip").forEach((chip) =>
@@ -216,9 +220,19 @@ formEl.addEventListener("submit", async (e) => {
     updateSend();
     setStatus("The live teacher is not available right now, so this is a normal text answer.");
   }
-  if (liveWS) {
+  if (liveWS || liveWanted) {
     const t = messageEl.value.trim();
-    if (!t || !liveReady) return;
+    if (!t) return;
+    if (!liveReady) {
+      setStatus("Reconnecting to the live teacher…");
+      try {
+        await liveWaitReady(25000);
+      } catch (_) {
+        setStatus("Still reconnecting. Your question is kept: send it again in a moment.");
+        return;
+      }
+      setStatus("");
+    }
     messageEl.value = "";
     autoGrow();
     updateSend();
@@ -233,11 +247,7 @@ formEl.addEventListener("submit", async (e) => {
   if (!message || busy) return;
 
   const level = levelEl.value;
-  const language = detectLanguage(message) || languageEl.value;
-  if (language !== languageEl.value) {
-    languageEl.value = language;
-    applyLanguageDirection();
-  }
+  const language = languageEl.value; // the SELECTED language decides the answer; the server switches it only on an explicit request
   // Voice in -> voice out; also when "Read answers aloud" is on.
   const voiceMode = sentByVoice || speakEl.checked;
   sentByVoice = false;
@@ -305,6 +315,12 @@ formEl.addEventListener("submit", async (e) => {
     }
     const convId = res.headers.get("X-Conversation-Id");
     if (convId) currentConvId = convId;
+    const answerLang = res.headers.get("X-Language");
+    if (answerLang && answerLang !== languageEl.value) {
+      liveFollowLanguage(answerLang, true);
+      assistantBody.dir = RTL_LANGUAGES.has(answerLang) ? "rtl" : "";
+      assistantBody.lang = answerLang;
+    }
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -737,10 +753,7 @@ function useTranscript(text, spokenLang) {
     setStatus("I couldn't hear anything. Please try again a little closer to the microphone.");
     return;
   }
-  if (spokenLang && spokenLang !== languageEl.value) {
-    languageEl.value = spokenLang; // the server heard a different language than selected
-    applyLanguageDirection();
-  }
+  // (the language the student SPOKE does not change the answer language; only the selector or an explicit request does)
   messageEl.value = (messageEl.value ? messageEl.value + " " : "") + text.trim();
   autoGrow();
   updateSend();
@@ -779,7 +792,7 @@ micEl.addEventListener("click", async () => {
     }
     setStatus("The live teacher is not available right now; using the standard microphone.");
   }
-  if (liveWS) {
+  if (liveWS || liveWanted) {
     liveMic ? stopLiveMic() : startLiveMic();
     return;
   }
@@ -933,6 +946,16 @@ liveVoiceEl.addEventListener("change", () => {
 
 let liveWS = null;
 let liveReady = false;
+let liveWanted = false; // the student wants a lesson: if the socket drops (phone locked, network switch) it is re-opened by itself
+let liveEverReady = false; // this lesson has worked at least once (so a drop is a "reconnect", not "could not start")
+let liveReconnects = 0;
+let liveReconnectTimer = null;
+let livePingTimer = null;
+let liveWatchTimer = null;
+let liveLastMsg = 0; // last frame of any kind from the server (proves the socket is alive)
+let liveLastActivity = 0; // last sign that the current answer is progressing (voice, notes, captions)
+let liveMicWanted = false; // the mic was on: turn it on again after a reconnect
+let liveMuteUntil = 0; // phones: the mic is muted while the teacher talks (and a moment after) so the speaker is not heard as a new question
 let liveOut = null; // AudioContext used for playback (24 kHz)
 let liveNext = 0; // when the next audio chunk should start
 let liveSources = [];
@@ -940,7 +963,18 @@ let liveDropAudio = false; // "Stop" pressed: ignore the rest of this answer's a
 let liveMic = null; // { stream, ctx, node }
 let liveTurn = null; // the assistant bubble of the current answer
 let liveUser = null; // the user bubble of a spoken question
-window.__live = { state: "off", audioChunks: 0, audioBytes: 0, scheduledSeconds: 0, notes: 0, captions: 0, turns: 0, errors: [] };
+// Phones and tablets have the speaker next to the microphone: without echo cancellation of the highest quality the teacher's own voice
+// is heard as the student speaking, interrupts the teacher, and the lesson appears to freeze. So on touch devices the mic is half-duplex.
+const LIVE_HALF_DUPLEX = (() => {
+  try {
+    const saved = localStorage.getItem("luma_live_duplex");
+    if (saved) return saved === "half";
+  } catch (_) {}
+  return !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+})();
+// Timings (milliseconds); the browser tests shorten them.
+const LIVE_T = Object.assign({ ping: 15000, dead: 40000, stuck: 45000, watch: 5000, maxReconnects: 6 }, window.LUMA_LIVE_TIMING || {});
+window.__live = { state: "off", audioChunks: 0, audioBytes: 0, scheduledSeconds: 0, notes: 0, captions: 0, turns: 0, errors: [], reconnects: 0, pings: 0, languageSwitches: [], halfDuplex: LIVE_HALF_DUPLEX };
 
 function liveSetState(text, state) {
   liveStateEl.textContent = text;
@@ -948,14 +982,25 @@ function liveSetState(text, state) {
 }
 
 function liveEnsureOut() {
-  if (!liveOut) liveOut = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
-  if (liveOut.state === "suspended") liveOut.resume();
+  if (!liveOut) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    try {
+      liveOut = new AC({ sampleRate: 24000 });
+    } catch (_) {
+      liveOut = new AC(); // some phones refuse a custom rate; buffers are resampled when played
+    }
+    liveOut.onstatechange = () => {
+      if (liveOut && liveOut.state !== "running" && liveWanted && !document.hidden) liveOut.resume().catch(() => {});
+    };
+  }
+  if (liveOut.state !== "running") liveOut.resume().catch(() => {}); // "suspended" and, on iOS, "interrupted" (after a call or app switch)
   return liveOut;
 }
 
 function livePlay(buf) {
   window.__live.audioChunks++;
   window.__live.audioBytes += buf.byteLength;
+  liveLastActivity = Date.now();
   if (liveDropAudio) return;
   const ctx = liveEnsureOut();
   const even = buf.byteLength & ~1;
@@ -974,10 +1019,14 @@ function livePlay(buf) {
   liveNext = start + ab.duration;
   window.__live.scheduledSeconds += ab.duration;
   liveSources.push(src);
+  liveMuteUntil = Date.now() + (liveNext - ctx.currentTime) * 1000 + 600; // the mic stays muted until the speaker is quiet (phones)
   setSpeaking(true);
   src.onended = () => {
     liveSources = liveSources.filter((s) => s !== src);
-    if (!liveSources.length) setSpeaking(false);
+    if (!liveSources.length) {
+      setSpeaking(false);
+      liveMuteUntil = Date.now() + 500;
+    }
   };
 }
 
@@ -987,6 +1036,7 @@ function liveFlush(dropRest) {
   });
   liveSources = [];
   liveNext = 0;
+  liveMuteUntil = 0;
   if (dropRest) liveDropAudio = true;
   if (liveWS) setSpeaking(false);
 }
@@ -1019,19 +1069,44 @@ function liveRenderNotes() {
   scrollToBottom();
 }
 
+const LANGUAGE_LABELS = { en: "English", ur: "Urdu", ar: "Arabic", fa: "Persian", de: "German" };
+function liveFollowLanguage(lang, announce) {
+  if (!lang || lang === languageEl.value) return;
+  languageEl.value = lang;
+  applyLanguageDirection();
+  window.__live.languageSwitches.push(lang);
+  if (announce) setStatus(`Switched to ${LANGUAGE_LABELS[lang] || lang} as you asked.`);
+}
+
 function liveHandle(msg) {
+  liveLastMsg = Date.now();
   switch (msg.type) {
     case "ready":
       liveReady = true;
+      liveEverReady = true;
+      liveReconnects = 0;
+      liveLastActivity = Date.now();
       liveMicEl.disabled = false;
       liveSetState(msg.resumed ? "Live: continuing your lesson…" : "Live: type a question or turn the mic on", "ready");
+      // the selector may have changed while we were connecting or reconnecting
+      if (languageEl.value !== msg.language && liveWS && liveWS.readyState === 1) liveWS.send(JSON.stringify({ type: "set_language", language: languageEl.value }));
+      if (liveMicWanted && !liveMic) startLiveMic();
+      break;
+    case "ping":
+      window.__live.pings++;
+      break;
+    case "pong":
+      break;
+    case "turn_start":
+      // every question opens a new turn: nothing of the previous answer can leak into it, and nothing can stay stuck
+      liveTurn = liveUser = null;
+      liveDropAudio = false;
+      liveLastActivity = Date.now();
+      if (msg.language && msg.language !== languageEl.value) liveFollowLanguage(msg.language, false);
       break;
     case "language":
-      // the server detected the language of the question (e.g. Urdu while the selector said English): follow it
-      if (msg.language && msg.language !== languageEl.value) {
-        languageEl.value = msg.language;
-        applyLanguageDirection();
-      }
+      // the student changed the selector or explicitly asked for another language ("explain this in Urdu"): follow it
+      liveFollowLanguage(msg.language, msg.reason === "requested");
       if (liveTurn) {
         liveTurn.body.dir = RTL_LANGUAGES.has(msg.language) ? "rtl" : "";
         liveTurn.body.lang = msg.language;
@@ -1047,7 +1122,9 @@ function liveHandle(msg) {
       break;
     case "notes_delta": {
       window.__live.notes++;
+      liveLastActivity = Date.now();
       const t = liveEnsureTurn();
+      t.notesEl.classList.remove("interim"); // the real notes replace the provisional transcript text
       t.notesMd += msg.text;
       liveScheduleRender();
       break;
@@ -1056,10 +1133,20 @@ function liveHandle(msg) {
       liveScheduleRender();
       break;
     case "notes_none":
-      if (liveTurn) liveTurn.noNotes = true; // greeting / small talk / out of scope: the teacher just answers by voice
+      // greeting / small talk / out of scope: the teacher just answers by voice, so what the teacher says IS the text on screen
+      if (liveTurn) {
+        liveTurn.noNotes = true;
+        liveShowTranscriptAsText(liveTurn);
+      }
+      break;
+    case "notes_failed":
+      // the written notes could not be produced: the voice transcript stays on screen as the answer, and the student is told
+      setStatus(msg.message || "");
+      if (liveTurn) liveShowTranscriptAsText(liveTurn);
       break;
     case "caption": {
       window.__live.captions++;
+      liveLastActivity = Date.now();
       if (msg.who === "user") {
         if (!liveUser) {
           emptyEl.hidden = true;
@@ -1071,23 +1158,37 @@ function liveHandle(msg) {
         const t = liveEnsureTurn();
         t.said += msg.text;
         t.saysText.textContent = t.said;
-        t.saysEl.hidden = false;
+        t.saysEl.hidden = !!t.notesMd ? false : true;
+        if (!t.notesMd) {
+          // voice and text together: until the written notes arrive, the words being spoken are shown on screen as they are spoken
+          t.notesEl.classList.add("interim");
+          t.notesEl.textContent = t.said;
+          scrollToBottom();
+        }
       }
       break;
     }
     case "interrupted":
-      liveFlush(false); // the student spoke over the teacher
+      liveFlush(false); // the student spoke over the teacher (or the voice is being restarted in the right language)
+      break;
+    case "voice_restart":
+      // the voice started in the wrong language and is being asked again: forget the wrong transcript
+      if (liveTurn) {
+        liveTurn.said = "";
+        liveTurn.saysText.textContent = "";
+        if (liveTurn.notesEl.classList.contains("interim")) liveTurn.notesEl.textContent = "";
+      }
       break;
     case "turn_complete":
-      if (liveTurn && !liveTurn.notesMd && !liveTurn.noNotes && liveTurn.said.length > 400) {
-        liveTurn.notesMd = liveTurn.said; // the model skipped the notes: don't leave the answer empty
-        liveRenderNotes();
-      }
+      if (liveTurn && !liveTurn.notesMd && liveTurn.said) liveShowTranscriptAsText(liveTurn); // never leave a spoken answer without text
       liveTurn = null;
       liveUser = null;
       liveDropAudio = false;
       liveSetState("Live: your turn", "your-turn");
       if (currentConvId) loadHistory();
+      break;
+    case "notice":
+      setStatus(msg.message || "");
       break;
     case "limit":
     case "error":
@@ -1098,27 +1199,58 @@ function liveHandle(msg) {
   }
 }
 
+// The teacher's words become the on-screen answer (small talk, or the notes could not be written): rendered like any other answer.
+function liveShowTranscriptAsText(t) {
+  if (t.notesMd || !t.said) return;
+  t.notesEl.classList.remove("interim");
+  t.notesMd = t.said;
+  t.saysEl.hidden = true;
+  liveRenderNotesFor(t);
+}
+function liveRenderNotesFor(t) {
+  renderInto(t.notesEl, t.notesMd);
+  scrollToBottom();
+}
+
+function liveStopTimers() {
+  clearInterval(livePingTimer);
+  clearInterval(liveWatchTimer);
+  clearTimeout(liveReconnectTimer);
+  livePingTimer = liveWatchTimer = liveReconnectTimer = null;
+}
+
 async function startLive() {
   if (liveWS) return;
+  clearTimeout(liveReconnectTimer);
   stopSpeaking();
+  liveWanted = true;
   liveReady = false;
   liveDropAudio = false;
   liveTurn = liveUser = null;
   liveBarEl.hidden = false;
   liveMicEl.disabled = true;
   messageEl.placeholder = "Ask the live teacher…";
-  liveSetState("Connecting…", "connecting");
-  setStatus("");
+  liveSetState(liveEverReady ? "Reconnecting…" : "Connecting…", liveEverReady ? "reconnecting" : "connecting");
+  if (!liveEverReady) setStatus("");
   liveEnsureOut(); // created inside the click so the browser allows audio
   const ws = new WebSocket(wsUrl("/api/live"));
   ws.binaryType = "arraybuffer";
   liveWS = ws;
-  ws.onopen = () =>
+  liveLastMsg = Date.now();
+  ws.onopen = () => {
     ws.send(JSON.stringify({
       type: "start", level: levelEl.value, language: languageEl.value, subject: subjectEl.value,
       gender: voiceGender, voice: liveVoiceEl.value || undefined, conversation_id: currentConvId,
     }));
+    clearInterval(livePingTimer);
+    livePingTimer = setInterval(() => {
+      if (liveWS === ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "ping" }));
+    }, LIVE_T.ping);
+    clearInterval(liveWatchTimer);
+    liveWatchTimer = setInterval(liveWatch, LIVE_T.watch);
+  };
   ws.onmessage = (ev) => {
+    liveLastMsg = Date.now();
     if (typeof ev.data === "string") {
       try { liveHandle(JSON.parse(ev.data)); } catch (_) {}
     } else {
@@ -1126,20 +1258,88 @@ async function startLive() {
     }
   };
   ws.onerror = () => window.__live.errors.push("socket error");
-  ws.onclose = () => {
-    if (liveWS === ws) {
-      if (!liveReady) setStatus("Could not start the live teacher. Please try again, or sign in again.");
-      endLive();
-    }
-  };
+  ws.onclose = () => liveSocketClosed(ws);
 }
+
+// The socket is gone. Before the lesson ever worked this is "could not start"; afterwards it is a dropped connection (phone locked,
+// network switched, server restarted) and the lesson is re-opened by itself with the same conversation, so the student never has to refresh.
+function liveSocketClosed(ws) {
+  if (liveWS !== ws) return;
+  liveWS = null;
+  liveReady = false;
+  liveStopTimersKeepWanted();
+  stopLiveMic(true);
+  liveFlush(false);
+  liveTurn = liveUser = null;
+  if (liveWanted && liveEverReady && liveReconnects < LIVE_T.maxReconnects) {
+    const delay = Math.min(400 * 2 ** liveReconnects, 5000);
+    liveReconnects++;
+    window.__live.reconnects++;
+    liveSetState("Connection lost, reconnecting…", "reconnecting");
+    liveReconnectTimer = setTimeout(() => {
+      if (liveWanted && !liveWS) startLive();
+    }, delay);
+    return;
+  }
+  if (!liveEverReady) setStatus("Could not start the live teacher. Please try again, or sign in again.");
+  else if (liveWanted) setStatus("The live teacher connection was lost. Tap the Live button to start again.");
+  endLive();
+}
+
+function liveStopTimersKeepWanted() {
+  clearInterval(livePingTimer);
+  clearInterval(liveWatchTimer);
+  livePingTimer = liveWatchTimer = null;
+}
+
+// Every few seconds: is the socket still alive, and is the current answer still progressing?
+function liveWatch() {
+  const now = Date.now();
+  if (liveWS && liveWS.readyState === 1 && now - liveLastMsg > LIVE_T.dead) {
+    // nothing at all (not even the server's keep-alive ping): the socket is half-open, which phones do silently. Drop it and reconnect.
+    const dead = liveWS;
+    dead.onclose = null;
+    try { dead.close(); } catch (_) {}
+    liveSocketClosed(dead);
+    return;
+  }
+  const st = window.__live.state;
+  if ((st === "answering" || st === "listening") && now - liveLastActivity > LIVE_T.stuck && liveSources.length === 0) {
+    // the answer stopped progressing and the server did not say why: free the UI so the next question can be asked
+    liveTurn = liveUser = null;
+    liveDropAudio = false;
+    liveSetState("Live: your turn", "your-turn");
+    setStatus("The teacher did not answer. Please ask again.");
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  if (liveOut) liveEnsureOut();
+  if (!liveWanted) return;
+  if (!liveWS || liveWS.readyState !== 1) {
+    clearTimeout(liveReconnectTimer);
+    if (!liveWS) startLive();
+  } else {
+    liveWS.send(JSON.stringify({ type: "ping" })); // prove the socket still works after the phone was asleep
+    liveLastMsg = Math.min(liveLastMsg, Date.now() - LIVE_T.dead + 8000); // ...and give it 8 s to answer
+  }
+});
+window.addEventListener("pageshow", () => document.dispatchEvent(new Event("visibilitychange")));
+window.addEventListener("online", () => document.dispatchEvent(new Event("visibilitychange")));
 
 function endLive() {
   const ws = liveWS;
   liveWS = null;
+  liveWanted = false;
+  liveEverReady = false;
   liveReady = false;
-  stopLiveMic();
+  liveReconnects = 0;
+  liveMicWanted = false;
+  liveStopTimers();
+  stopLiveMic(true);
   if (ws) {
+    ws.onclose = null;
     try { if (ws.readyState === 1) ws.send(JSON.stringify({ type: "stop" })); ws.close(); } catch (_) {}
   }
   liveFlush(false);
@@ -1154,14 +1354,16 @@ function liveSendText(text) {
   liveFlush(false); // typing while the teacher talks interrupts it
   liveDropAudio = false;
   liveTurn = liveUser = null;
-  const asked = detectLanguage(text); // Urdu/Arabic/Persian script: switch the selector to the language of the question
-  if (asked && asked !== languageEl.value) {
-    languageEl.value = asked;
-    applyLanguageDirection();
-  }
+  // The answer language is the one selected in the interface. It is NOT guessed from the question: only the selector or an explicit
+  // request ("explain this in Urdu") changes it, and the server tells us when it does.
   addMessage("user", text, languageEl.value);
+  liveLastActivity = Date.now();
   liveWS.send(JSON.stringify({ type: "text", text }));
   liveSetState("Live: the teacher is answering…", "answering");
+}
+
+function liveSyncLanguage() {
+  if (liveWS && liveReady && liveWS.readyState === 1) liveWS.send(JSON.stringify({ type: "set_language", language: languageEl.value }));
 }
 
 // 16 kHz mono PCM16 from the microphone (the Live API's input format), 100 ms per frame.
@@ -1192,16 +1394,23 @@ registerProcessor('pcm16k', Pcm16k);`;
 
 async function startLiveMic() {
   if (liveMic || !liveWS) return;
+  liveMicWanted = true;
+  liveEnsureOut(); // the tap that turned the mic on also unlocks audio playback on phones
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
+    if (!liveWS) { stream.getTracks().forEach((t) => t.stop()); return; } // the lesson ended while the permission prompt was open
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state !== "running") await ctx.resume().catch(() => {});
     const url = URL.createObjectURL(new Blob([PCM_WORKLET], { type: "application/javascript" }));
     await ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
     const node = new AudioWorkletNode(ctx, "pcm16k");
     node.port.onmessage = (e) => {
-      if (liveWS && liveWS.readyState === 1) liveWS.send(e.data);
+      if (!liveWS || liveWS.readyState !== 1 || !liveReady) return;
+      if (LIVE_HALF_DUPLEX && Date.now() < liveMuteUntil) return; // phones: do not send the teacher's own voice back as a "question"
+      liveWS.send(e.data);
     };
     const mute = ctx.createGain();
     mute.gain.value = 0; // keep the node pulled by the graph without playing the mic back
@@ -1211,12 +1420,15 @@ async function startLiveMic() {
     liveMicEl.textContent = "Mic: on";
     liveMicEl.classList.add("on");
     liveSetState("Live: listening to you…", "listening");
+    liveLastActivity = Date.now();
   } catch (err) {
+    liveMicWanted = false;
     setStatus("Microphone unavailable: " + err.message);
   }
 }
 
-function stopLiveMic() {
+function stopLiveMic(silent) {
+  if (!silent) liveMicWanted = false;
   if (!liveMic) return;
   const m = liveMic;
   liveMic = null;
@@ -1224,29 +1436,41 @@ function stopLiveMic() {
   m.ctx.close().catch(() => {});
   liveMicEl.textContent = "Mic: off";
   liveMicEl.classList.remove("on");
-  if (liveWS && liveWS.readyState === 1) liveWS.send(JSON.stringify({ type: "mic_stop" }));
+  if (!silent && liveWS && liveWS.readyState === 1) liveWS.send(JSON.stringify({ type: "mic_stop" }));
 }
 
 function liveAvailable() {
   return !!(appConfig.live_enabled && window.WebSocket && (window.AudioContext || window.webkitAudioContext));
 }
-let liveAuto = true; // default: every question and the microphone go to the live teacher
-try { liveAuto = localStorage.getItem("luma_live_auto") !== "0"; } catch (_) {}
+// Live mode is ALWAYS on: every question and the microphone go to the live teacher, which opens (and re-opens) by itself. The Live button is
+// only an indicator of the connection: filled = a lesson is connected, pulsing = connecting / reconnecting, outlined = idle (the next
+// question or a tap connects it). It cannot switch live mode off.
+const liveAuto = true;
+function renderLiveIndicator() {
+  const st = liveReady ? "on" : (liveWS || liveWanted) ? "connecting" : "idle";
+  if (liveToggleEl.dataset.state !== st) liveToggleEl.dataset.state = st;
+  liveToggleEl.title = {
+    on: "Live teacher connected: it writes the notes and explains them aloud",
+    connecting: "Connecting to the live teacher…",
+    idle: "Live teacher ready: ask a question (or tap) and it connects",
+  }[st];
+}
 function renderLiveMode() {
-  const on = liveAvailable() && liveAuto;
-  liveToggleEl.classList.toggle("on", on);
-  liveToggleEl.setAttribute("aria-pressed", on ? "true" : "false");
-  // the old read-aloud switch (Edge TTS, sentence by sentence) is only offered when the live teacher is off or unavailable
+  const on = liveAvailable();
+  renderLiveIndicator();
+  // the old read-aloud switch (Edge TTS, sentence by sentence) is only offered when the live teacher is unavailable on this server/browser
   const readAloud = speakEl.closest("label");
   if (readAloud) readAloud.hidden = on;
   if (on) speakEl.checked = false;
 }
+setInterval(renderLiveIndicator, 400);
+// Resolves when the lesson is ready. While a reconnect is in progress (liveWanted) it keeps waiting instead of giving up at once.
 function liveWaitReady(ms = 20000) {
   return new Promise((resolve, reject) => {
     const t0 = Date.now();
     const iv = setInterval(() => {
       if (liveReady) { clearInterval(iv); resolve(); }
-      else if (!liveWS || Date.now() - t0 > ms) { clearInterval(iv); reject(new Error("live teacher not ready")); }
+      else if ((!liveWS && !liveWanted) || Date.now() - t0 > ms) { clearInterval(iv); reject(new Error("live teacher not ready")); }
     }, 100);
   });
 }
@@ -1255,12 +1479,16 @@ async function ensureLive() {
   if (!liveWS) await startLive();
   try { await liveWaitReady(); return true; } catch (_) { return false; }
 }
-liveToggleEl.addEventListener("click", () => {
-  liveAuto = !liveAuto;
-  try { localStorage.setItem("luma_live_auto", liveAuto ? "1" : "0"); } catch (_) {}
-  if (!liveAuto && liveWS) endLive();
-  renderLiveMode();
-  setStatus(liveAuto ? "Live teacher on: your questions are explained by voice with notes on screen." : "Live teacher off: normal text chat.");
+liveToggleEl.addEventListener("click", async () => {
+  // a tap never turns live mode off: it just connects the lesson now (also unlocks audio on phones) if it is not connected yet
+  liveEnsureOut();
+  if (liveReady) {
+    setStatus("Live teacher connected: ask your question, it writes the notes and explains them aloud.");
+    return;
+  }
+  setStatus("Connecting the live teacher…");
+  const ok = await ensureLive();
+  setStatus(ok ? "Live teacher connected. Ask your question." : "Could not connect the live teacher yet. It will keep trying when you ask.");
 });
 $("live-end").addEventListener("click", endLive);
 liveMicEl.addEventListener("click", () => (liveMic ? stopLiveMic() : startLiveMic()));
@@ -1306,6 +1534,12 @@ function renderLoginButton() {
   const domain = appConfig.allowed_email_domain || "tuf.edu.pk";
   $("login-domain").textContent = "@" + domain;
   $("dev-login").hidden = !appConfig.dev_login;
+  // email-only sign-in (no Google configured): say so instead of promising a Google button
+  const devOnly = appConfig.dev_login && !appConfig.google_client_id;
+  const note = document.querySelector(".login-note");
+  if (note && devOnly) note.innerHTML = "Enter your university email <b>@" + domain + "</b> to continue.";
+  const tag = document.querySelector(".dev-tag");
+  if (tag && devOnly) tag.hidden = true;
   const holder = $("g-btn");
   holder.innerHTML = "";
   if (!appConfig.google_client_id) {
@@ -1507,3 +1741,4 @@ updateSend();
   } catch (_) {}
   showLogin();
 })();
+

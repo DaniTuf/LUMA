@@ -1,16 +1,26 @@
-"""Google sign-in restricted to the university domain, with signed session cookies."""
+﻿"""Google sign-in restricted to the university domain, with signed session cookies."""
 import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 from pydantic import BaseModel
 
-from . import config, db
+from . import config, db, errors
 
 router = APIRouter(prefix="/api/auth")
 
 COOKIE = "luma_session"
 _signer = URLSafeTimedSerializer(config.SECRET_KEY, salt="luma-session")
+
+
+async def _lookup(email: str) -> dict | None:
+    """The signed-in student, or None. A database outage is reported as 503 (not as "please sign in"): the session itself is fine."""
+    if not is_allowed_email(email):
+        return None
+    try:
+        return await db.get_user(email)
+    except db.DatabaseUnavailable as exc:
+        raise errors.LumaError("DB_UNAVAILABLE", str(exc))
 
 
 def is_allowed_email(email: str) -> bool:
@@ -30,7 +40,7 @@ def _start_session(response: Response, request: Request, email: str) -> None:
     )
 
 
-def current_user(request: Request) -> dict:
+async def current_user(request: Request) -> dict:
     token = request.cookies.get(COOKIE)
     if not token:
         raise HTTPException(401, "Please sign in.")
@@ -39,13 +49,13 @@ def current_user(request: Request) -> dict:
     except BadSignature:
         raise HTTPException(401, "Session expired. Please sign in again.")
     email = data.get("e", "")
-    user = db.get_user(email) if is_allowed_email(email) else None
+    user = await _lookup(email)
     if not user:
         raise HTTPException(401, "Please sign in.")
     return user
 
 
-def current_user_ws(websocket) -> dict | None:
+async def current_user_ws(websocket) -> dict | None:
     """Same session-cookie check as current_user(), but for a WebSocket connection.
 
     A WebSocket can't be answered with an HTTPException before it's accepted, so this
@@ -58,7 +68,7 @@ def current_user_ws(websocket) -> dict | None:
     except BadSignature:
         return None
     email = data.get("e", "")
-    return db.get_user(email) if is_allowed_email(email) else None
+    return await _lookup(email)
 
 
 class GoogleLogin(BaseModel):
@@ -86,7 +96,7 @@ async def login_google(body: GoogleLogin, request: Request, response: Response):
     if not info.get("email_verified") or not is_allowed_email(email) or info.get("hd") != config.ALLOWED_EMAIL_DOMAIN:
         raise HTTPException(403, f"Only @{config.ALLOWED_EMAIL_DOMAIN} accounts can sign in.")
 
-    user = db.upsert_user(email, info.get("name") or email.split("@")[0], info.get("picture") or "")
+    user = await db.upsert_user(email, info.get("name") or email.split("@")[0], info.get("picture") or "")
     _start_session(response, request, email)
     return user
 
@@ -96,20 +106,20 @@ class DevLogin(BaseModel):
 
 
 @router.post("/dev")
-def login_dev(body: DevLogin, request: Request, response: Response):
+async def login_dev(body: DevLogin, request: Request, response: Response):
     """Local development only (DEV_LOGIN=1): sign in without Google, still limited to the domain."""
     if not config.DEV_LOGIN:
         raise HTTPException(404, "Not found")
     email = body.email.strip().lower()
     if not is_allowed_email(email):
         raise HTTPException(403, f"Only @{config.ALLOWED_EMAIL_DOMAIN} accounts can sign in.")
-    user = db.upsert_user(email, email.split("@")[0].replace(".", " ").title(), "")
+    user = await db.upsert_user(email, email.split("@")[0].replace(".", " ").title(), "")
     _start_session(response, request, email)
     return user
 
 
 @router.get("/me")
-def me(user: dict = Depends(current_user)):
+async def me(user: dict = Depends(current_user)):
     return user
 
 
@@ -117,3 +127,4 @@ def me(user: dict = Depends(current_user)):
 def logout(response: Response):
     response.delete_cookie(COOKIE)
     return {"ok": True}
+

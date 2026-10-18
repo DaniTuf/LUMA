@@ -10,3 +10,6 @@ google-genai
 anthropic
 openai
 python-multipart
+redis>=5.0
+sqlalchemy[asyncio]>=2.0
+asyncpg>=0.29

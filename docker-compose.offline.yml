@@ -1,0 +1,14 @@
+# Use when Docker cannot reach the registries (error: "lookup registry-1.docker.io: no such host").
+# One-time: tag the images that are already on this machine as the bases:
+#   docker tag ai_tutor-main-luma_backend:latest luma-base-backend:offline
+#   docker tag ai_tutor-main-luma_frontend:latest luma-base-frontend:offline
+# Then:
+#   docker compose -f docker-compose.yml -f docker-compose.offline.yml up -d --build
+# (redis:7-alpine must also be present locally: `docker images redis`)
+services:
+  luma_backend:
+    build:
+      dockerfile: backend/Dockerfile.offline
+  luma_frontend:
+    build:
+      dockerfile: frontend/Dockerfile.offline

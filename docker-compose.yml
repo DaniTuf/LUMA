@@ -1,4 +1,53 @@
 services:
+  # The one database. Several backend workers (and containers, if you scale) share it; see backend/db.py for how connections are budgeted:
+  #   connections = WEB_CONCURRENCY x (DB_POOL_SIZE + DB_MAX_OVERFLOW)  must stay below max_connections here.
+  luma_postgres:
+    image: postgres:16-alpine
+    container_name: luma_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-luma}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-luma}
+    command:
+      - postgres
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - idle_in_transaction_session_timeout=30000     # a crashed worker's open transaction is rolled back after 30 s
+      - -c
+      - log_min_duration_statement=500                # slow queries (>0.5 s) show up in `docker logs luma_postgres`
+    volumes:
+      - luma_pg_data:/var/lib/postgresql/data        # a Docker volume (NOT a Windows folder): safe for Postgres
+    ports:
+      - "127.0.0.1:5432:5432"                          # only this PC (psql, or uvicorn run outside Docker)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-luma} -d $${POSTGRES_DB:-luma}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      - luma_network
+
+  # Shared state for every backend worker: daily message cap, provider cool-downs, answer checkpoints (resume after a crash),
+  # the failure log and live-lesson locks. If this container is down LUMA keeps working from memory (see backend/state.py).
+  luma_redis:
+    image: redis:7-alpine
+    container_name: luma_redis
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-lru"]
+    volumes:
+      - luma_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - luma_network
+
   luma_backend:
     build:
       context: .
@@ -7,6 +56,17 @@ services:
     container_name: luma_api
     env_file:
       - .env
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://luma_redis:6379/0}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-luma}:${POSTGRES_PASSWORD}@luma_postgres:5432/${POSTGRES_DB:-luma}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"   # this network has no IPv6 route: Google's AAAA addresses only caused stalls before falling back to IPv4
+    depends_on:
+      luma_postgres:
+        condition: service_healthy
+      luma_redis:
+        condition: service_healthy
     volumes:
       - ./data:/app/data
     ports:
@@ -24,7 +84,7 @@ services:
       dockerfile: frontend/Dockerfile
     container_name: luma_ui
     ports:
-      - "8080:80"
+      - "${HTTP_PORT:-8080}:80"        # set HTTP_PORT=80 on a public server
       - "${HTTPS_PORT:-8443}:443"      # https (set HTTPS_PORT=443 in .env to use the standard port)
     environment:
       LUMA_HOSTS: ${LUMA_HOSTS:-localhost,127.0.0.1}      # addresses the self-signed certificate is made for
@@ -35,6 +95,10 @@ services:
     restart: unless-stopped
     networks:
       - luma_network
+
+volumes:
+  luma_redis_data:
+  luma_pg_data:
 
 networks:
   luma_network:

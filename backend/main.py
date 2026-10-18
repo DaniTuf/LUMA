@@ -1,22 +1,59 @@
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
+﻿from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from . import auth, config, curriculum, db, live, usage, voice
-from .llm import NO_NOTES_MARK, TRUNCATED_MARK, stream_tutor_reply
+from . import auth, config, curriculum, db, errors, guard, langpolicy, live, state, usage, voice
+from .llm import NO_NOTES_MARK, TRUNCATED_MARK
 from .router import router
 import asyncio
 import json
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 app = FastAPI(title="LUMA - Learning & University Mentor Assistant")
+errors.install(app)
 app.include_router(auth.router)
 app.include_router(live.router)
 
-HISTORY_TURNS = 20 
+HISTORY_TURNS = 20
 
 @app.on_event("startup")
-async def _warm_voices():
+async def _startup():
+    # Several workers start together and Postgres may still be starting: wait for it (the schema step is serialised by an advisory lock).
+    for attempt in range(1, 31):
+        try:
+            await db.init_db()
+            break
+        except Exception as exc:
+            if attempt == 30:
+                await errors.report("startup", exc, action="database_unreachable")
+                raise
+            logging.getLogger("luma").warning("database not ready (%s), retry %d/30", type(exc).__name__, attempt)
+            await asyncio.sleep(1)
     asyncio.create_task(voice.warm_up())
+    st = await state.status()
+    logging.getLogger("luma").info("redis: %s", "connected" if st["connected"] else ("configured but UNREACHABLE (memory fallback)" if st["configured"] else "not configured (memory fallback)"))
+
+@app.on_event("shutdown")
+async def _close_state():
+    await state.close()
+    await db.dispose()
+
+@app.get("/api/health")
+async def health():
+    """Liveness + dependency status for the load balancer / uptime monitor (no secrets, no user data)."""
+    st = await state.status()
+    database = await db.ping()
+    return {"ok": database, "database": {"connected": database, "pool": await db.pool_status() if database else {}}, "redis": st,
+            "gemini_live": bool(config.GEMINI_API_KEY), "judge": bool(config.JUDGE_ENABLED)}
+
+@app.get("/api/admin/failures")
+async def admin_failures(count: int = 50, user: dict = Depends(auth.current_user)):
+    """The latest failures (LLM / voice / judge / worker) with the action taken, for the operators listed in ADMIN_EMAILS."""
+    if user["email"].lower() not in config.ADMIN_EMAILS:
+        raise errors.LumaError("FORBIDDEN")
+    return await state.recent_failures(max(1, min(count, 200)))
 
 @app.middleware("http")
 async def no_cache(request, call_next):
@@ -54,32 +91,32 @@ def get_public_config():
     }
 
 @app.get("/api/conversations")
-def list_conversations(user: dict = Depends(auth.current_user)):
-    return db.list_conversations(user["email"])
+async def list_conversations(user: dict = Depends(auth.current_user)):
+    return await db.list_conversations(user["email"])
 
 @app.get("/api/conversations/{cid}")
-def get_conversation(cid: str, user: dict = Depends(auth.current_user)):
-    conv = db.get_conversation(user["email"], cid)
+async def get_conversation(cid: str, user: dict = Depends(auth.current_user)):
+    conv = await db.get_conversation(user["email"], cid)
     if not conv:
-        raise HTTPException(404, "Conversation not found")
-    return {**conv, "messages": db.get_messages(cid)}
+        raise errors.LumaError("NOT_FOUND", "conversation")
+    return {**conv, "messages": await db.get_messages(cid)}
 
 class RenameRequest(BaseModel):
     title: str
 
 @app.patch("/api/conversations/{cid}")
-def rename_conversation(cid: str, body: RenameRequest, user: dict = Depends(auth.current_user)):
+async def rename_conversation(cid: str, body: RenameRequest, user: dict = Depends(auth.current_user)):
     title = body.title.strip()[:120]
     if not title:
-        raise HTTPException(400, "Title cannot be empty")
-    if not db.rename_conversation(user["email"], cid, title):
-        raise HTTPException(404, "Conversation not found")
+        raise errors.LumaError("BAD_REQUEST", "empty title")
+    if not await db.rename_conversation(user["email"], cid, title):
+        raise errors.LumaError("NOT_FOUND", "conversation")
     return {"ok": True}
 
 @app.delete("/api/conversations/{cid}")
-def delete_conversation(cid: str, user: dict = Depends(auth.current_user)):
-    if not db.delete_conversation(user["email"], cid):
-        raise HTTPException(404, "Conversation not found")
+async def delete_conversation(cid: str, user: dict = Depends(auth.current_user)):
+    if not await db.delete_conversation(user["email"], cid):
+        raise errors.LumaError("NOT_FOUND", "conversation")
     return {"ok": True}
 
 def _clean_reply(text: str) -> str:
@@ -92,62 +129,66 @@ def _make_title(message: str) -> str:
 @app.post("/api/chat")
 async def chat(req: ChatRequest, user: dict = Depends(auth.current_user)):
     if req.level not in config.ACADEMIC_LEVELS:
-        raise HTTPException(400, f"Invalid level: {req.level}")
+        raise errors.LumaError("BAD_REQUEST", f"invalid level {req.level}")
     if req.language not in config.SUPPORTED_LANGUAGES:
-        raise HTTPException(400, f"Unsupported language: {req.language}")
+        raise errors.LumaError("BAD_REQUEST", f"unsupported language {req.language}")
 
     message = req.message.strip()
     if not message:
-        raise HTTPException(400, "Message is empty")
+        raise errors.LumaError("BAD_REQUEST", "empty message")
     if len(message) > 4000:
-        raise HTTPException(400, "Message is too long (max 4000 characters)")
+        raise errors.LumaError("MESSAGE_TOO_LONG")
 
     email = user["email"]
 
     if req.conversation_id:
-        if not db.get_conversation(email, req.conversation_id):
-            raise HTTPException(404, "Conversation not found")
+        if not await db.get_conversation(email, req.conversation_id):
+            raise errors.LumaError("NOT_FOUND", "conversation")
         cid = req.conversation_id
     else:
         cid = None
 
-    allowed, _remaining = usage.check_and_increment(email)
+    allowed, _remaining = await usage.check_and_increment(email)
     if not allowed:
-        raise HTTPException(429, "Daily message limit reached for this pilot account.")
+        raise errors.LumaError("RATE_LIMIT_DAILY")
 
     provider, wait_time = router.get_provider()
 
     if cid is None:
-        cid = db.create_conversation(email, _make_title(message))
+        cid = await db.create_conversation(email, _make_title(message))
 
-    history = db.get_messages(cid, limit=HISTORY_TURNS)
-    db.add_message(cid, "user", message)
+    history = await db.get_messages(cid, limit=HISTORY_TURNS)
+    await db.add_message(cid, "user", message)
 
-        # Inside @app.post("/api/chat")
+    # The answer language is the one selected in the interface; it changes only when the student explicitly asks for another one.
+    language = langpolicy.explicit_request(message) or req.language
+
     async def event_stream():
         collected = ""
-        failed = False
         try:
-            async for piece in stream_tutor_reply(
-                message, req.level, req.language, history, req.subject.strip()[:100], req.voice_mode, req.notes_mode
+            async for piece in guard.guarded_reply(
+                message, req.level, language, history, req.subject.strip()[:100], voice_mode=req.voice_mode, notes_mode=req.notes_mode
             ):
                 collected += piece
                 yield piece
         except Exception as exc:
-            failed = True
-            yield f"\n\n[Error generating response: {exc}]"
+            code = await errors.report("chat", exc, action="stream_failed", language=language)
+            yield "\n\n" + errors.message(code, language)                          # a kind sentence: no provider names, no error details
         finally:
             reply = _clean_reply(collected)
-            if reply and not failed and not reply.startswith(NO_NOTES_MARK):
-                # FIX Issue #7: Run DB write in a separate thread to prevent asyncio blocking
-                await asyncio.to_thread(db.add_message, cid, "assistant", reply)
+            if reply and not reply.startswith(NO_NOTES_MARK):
+                try:                                                                 # a partial answer is kept too
+                    await db.add_message(cid, "assistant", reply)
+                except Exception as exc:
+                    await errors.report("chat", exc, action="answer_not_saved", conversation=cid)
 
     return StreamingResponse(
         event_stream(),
         media_type="text/plain",
         headers={
             "X-Conversation-Id": cid,
-            "Access-Control-Expose-Headers": "X-Conversation-Id",
+            "X-Language": language,
+            "Access-Control-Expose-Headers": "X-Conversation-Id, X-Language",
             "X-Accel-Buffering": "no",
         },
     )
@@ -157,19 +198,24 @@ async def lesson(req: ChatRequest, user: dict = Depends(auth.current_user)):
     """The spoken explanation for the normal voice (same teacher style as Live). Streamed as plain text for text-to-speech;
     not saved and not counted: the written notes request (/api/chat) is what is saved and counted."""
     if req.level not in config.ACADEMIC_LEVELS or req.language not in config.SUPPORTED_LANGUAGES:
-        raise HTTPException(400, "Invalid level or language")
+        raise errors.LumaError("BAD_REQUEST", "invalid level or language")
     message = req.message.strip()
     if not message or len(message) > 4000:
-        raise HTTPException(400, "Message is empty or too long")
+        raise errors.LumaError("MESSAGE_TOO_LONG" if message else "BAD_REQUEST")
     history = []
-    if req.conversation_id and db.get_conversation(user["email"], req.conversation_id):
-        history = db.get_messages(req.conversation_id, limit=HISTORY_TURNS)
+    if req.conversation_id and await db.get_conversation(user["email"], req.conversation_id):
+        history = await db.get_messages(req.conversation_id, limit=HISTORY_TURNS)
     history = [m for m in history if not str(m.get("content", "")).startswith(NO_NOTES_MARK)]
 
+    language = langpolicy.explicit_request(message) or req.language
+
     async def spoken():
-        async for piece in stream_tutor_reply(message, req.level, req.language, history, req.subject.strip()[:100],
-                                              True, False, True):
-            yield piece
+        try:
+            async for piece in guard.guarded_reply(message, req.level, language, history, req.subject.strip()[:100],
+                                                   voice_mode=True, lesson_mode=True):
+                yield piece
+        except Exception as exc:
+            await state.log_failure("lesson", exc, action="stream_failed", language=language)
 
     return StreamingResponse(spoken(), media_type="text/plain", headers={"X-Accel-Buffering": "no"})
 
@@ -205,7 +251,7 @@ async def stt_stream(websocket: WebSocket):
     with the fast single-pass path, and the result goes back as a partial caption while the
     user is still talking. On {"type": "stop"} the full, more accurate speech_to_text() runs
     once on the whole recording and the result goes back marked final."""
-    user = auth.current_user_ws(websocket)
+    user = await auth.current_user_ws(websocket)
     if not user:
         await websocket.close(code=4401)
         return
@@ -284,3 +330,4 @@ async def stt_stream(websocket: WebSocket):
             pass
 
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+

@@ -1,23 +1,19 @@
-"""Backend tests for the LUMA Live Teacher (/api/live). A fake Gemini Live session speaks the SDK's REAL message types and the notes writer
-is faked, so no API key, network or audio hardware is needed.   Run (inside the backend image):  python -m pytest tests -q
+﻿"""Backend tests for the LUMA Live Teacher (/api/live). A fake Gemini Live session speaks the SDK's REAL message types (including the
+show_notes tool call), so no API key, network or audio hardware is needed.   Run (inside the backend image):  python -m pytest tests -q
 """
 import asyncio
 import json
 import os
-import tempfile
+import time
 
-_tmp = tempfile.mkdtemp(prefix="luma_test_")
-os.environ["DB_PATH"] = os.path.join(_tmp, "luma.db")
-os.environ["DEV_LOGIN"] = "1"
-os.environ["GEMINI_API_KEY"] = "test-key-not-real"
-os.environ["MAX_MESSAGES_PER_USER_PER_DAY"] = "500"
 
 import pytest
 from fastapi.testclient import TestClient
 from google.genai import types
 from starlette.websockets import WebSocketDisconnect
 
-from backend import config, db, live, usage
+from sdb import reset_database, sdb  # noqa: F401
+from backend import config, db, judge, live, llm, state, usage
 from backend.llm import NO_NOTES_MARK
 from backend.main import app
 
@@ -42,33 +38,62 @@ def done():
     return types.LiveServerMessage(server_content=types.LiveServerContent(turn_complete=True))
 
 
+NOTES = {"md": None}        # when set, every scripted answer is preceded by the model WRITING these notes through the show_notes tool
+
+
+def tool_call(md, call_id="call-1", name="show_notes"):
+    return types.LiveServerMessage(tool_call=types.LiveServerToolCall(function_calls=[types.FunctionCall(id=call_id, name=name, args={"markdown": md})]))
+
+
 class FakeSession:
-    """receive() yields ONE model turn per call, like the SDK."""
+    """receive() yields ONE model turn per call, like the SDK. A study answer is two model turns, exactly as on the real service
+    (checked live): turn 1 = the show_notes tool call + "turn complete"; after our tool response, turn 2 = the spoken elaboration."""
 
     def __init__(self, scripts):
         self.scripts, self.q = list(scripts), asyncio.Queue()
         self.sent_text, self.sent_audio, self.audio_end, self.client_content = [], [], 0, []
+        self.tool_responses, self.tool_calls, self.pending_voice = [], [], None
         self.yielded = 0
 
     def push(self, msgs):
         for m in msgs:
             self.q.put_nowait(m)
 
+    def _start_answer(self, tool=True):
+        script = self.scripts.pop(0) if self.scripts else [done()]
+        md = NOTES["md"]
+        if tool and md and any(m.server_content and m.server_content.model_turn for m in script):
+            self.tool_calls.append(md)
+            k = 0                                                # what the student said (and any interruption) comes BEFORE the model reacts
+            while k < len(script) and script[k].server_content and (script[k].server_content.interrupted or script[k].server_content.input_transcription):
+                k += 1
+            self.push(script[:k])
+            self.pending_voice = list(script[k:])
+            self.push([tool_call(md), done()])
+        else:
+            self.push(script)
+
     async def send_realtime_input(self, **kw):
         if "text" in kw:
             self.sent_text.append(kw["text"])
-            self.push(self.scripts.pop(0) if self.scripts else [done()])
+            self._start_answer()
         if "audio" in kw:
             self.sent_audio.append((kw["audio"].mime_type, len(kw["audio"].data)))
             if len(self.sent_audio) == 1 and self.scripts:       # first mic frame starts a scripted "spoken" turn
-                self.push(self.scripts.pop(0))
+                self._start_answer()
         if kw.get("audio_stream_end"):
             self.audio_end += 1
 
     async def send_client_content(self, turns=None, turn_complete=True):
         self.client_content.append((turns, turn_complete))
-        if turn_complete and self.scripts:                       # an explicit turn (Stop note / resume) makes the model answer
-            self.push(self.scripts.pop(0))
+        if turn_complete and self.scripts:                       # an explicit turn (Stop note / resume / language fix) makes the model answer
+            self._start_answer(tool=False)
+
+    async def send_tool_response(self, function_responses=None, **kw):
+        self.tool_responses.append(function_responses)
+        if self.pending_voice is not None:                       # the tool returned: the model now speaks
+            self.push(self.pending_voice)
+            self.pending_voice = None
 
     async def receive(self):
         while True:
@@ -93,28 +118,29 @@ class Ctx:
 
 
 def fake_notes(monkeypatch, pieces, delay=0.0, fail=False):
-    """Replace the text-model notes writer (llm.stream_tutor_reply) and record how it was called."""
-    calls = []
+    """The model WRITES these notes (the show_notes tool call) before it speaks. `[NO_NOTES_MARK]` = small talk: no notes, voice only."""
+    md = "".join(pieces)
+    monkeypatch.setitem(NOTES, "md", None if md.strip().startswith("[[LUMA_") or not md.strip() else md)
+    return NOTES
 
-    async def gen(message, level, language, history, subject="", voice_mode=False, notes_mode=False):
-        calls.append(dict(message=message, level=level, language=language, history=history, subject=subject, voice_mode=voice_mode, notes_mode=notes_mode))
-        for p in pieces:
-            if delay:
-                await asyncio.sleep(delay)
-            yield p
-        if fail:
-            raise RuntimeError("provider exploded test-key-not-real")
 
-    monkeypatch.setattr(live, "stream_tutor_reply", gen)
-    return calls
+async def _judge_ok(prompt):
+    return '{"language_ok": true, "quality_ok": true, "issues": [], "instruction": ""}'
 
 
 @pytest.fixture()
 def client(monkeypatch):
     monkeypatch.setattr(config, "GEMINI_API_KEY", "test-key-not-real")
     monkeypatch.setattr(config, "LIVE_START_WAIT", 0)
-    live._active_users.clear()
-    usage._usage.clear()
+    monkeypatch.setattr(config, "LIVE_TICK_SECONDS", 0.05)
+    monkeypatch.setattr(config, "LIVE_RECONNECT_DELAY", 0.01)
+    monkeypatch.setattr(config, "JUDGE_HEAD_CHARS", 20)
+    monkeypatch.setattr(judge, "_call_judge_model", _judge_ok)       # never call a real model from tests
+    reset_database()
+    state.reset_memory()
+    if config.REDIS_URL:                                  # running the suite against a real Redis: start from an empty one
+        import redis as _redis
+        _redis.Redis.from_url(config.REDIS_URL).flushdb()
     c = TestClient(app)
     assert c.post("/api/auth/dev", json={"email": EMAIL}).status_code == 200
     return c
@@ -163,17 +189,18 @@ def test_live_config_is_voice_only_and_follows_gemini_3_8_rules():
     cfg = live.build_config("undergraduate", "en", "", "Sulafat")
     assert cfg.response_modalities == ["AUDIO"]
     assert cfg.input_audio_transcription is not None and cfg.output_audio_transcription is not None
-    assert not cfg.tools, "the voice must have NO tools: it can never see or write the notes"
+    names = [fd.name for t in cfg.tools for fd in t.function_declarations]
+    assert names == ["show_notes"], "ONE model does everything: its only tool is the one that writes its own notes"
     assert list(cfg.input_audio_transcription.language_codes) == ["ur-PK", "ar-SA", "fa-IR", "en-US", "de-DE"], "Urdu speech must not be transcribed as Hindi"
     assert cfg.thinking_config is None and not cfg.enable_affective_dialog and cfg.proactivity is None
     assert cfg.speech_config.voice_config.prebuilt_voice_config.voice_name == "Sulafat"
     assert config.LIVE_MODEL == "gemini-3.8-live"
 
 
-def test_prompt_makes_the_voice_teach_not_read_and_keeps_luma_rules():
+def test_prompt_makes_the_model_write_then_elaborate_and_keeps_luma_rules():
     p = live.build_live_prompt("foundation", "en", "Physics")
-    for must in ("SCOPE:", "IDENTITY:", "Enterprise Solutions Team", "Physics", "foundation-year", "YOU CANNOT SEE THEM",
-                 "do NOT give a textbook summary", "short story", "ONE worked", "trap most students fall into"):
+    for must in ("SCOPE:", "IDENTITY:", "Enterprise Solutions Team", "Physics", "foundation-year", "STEP 1 - WRITE", "show_notes", "STEP 2 - ELABORATE ALOUD",
+                 "Do NOT read the notes out", "most important or hardest part", "short story", "trap most students fall into", "NO NOTES FOR"):
         assert must in p, must
     assert "Never say you were made by Google" in p
 
@@ -206,11 +233,11 @@ def test_live_requires_login():
 
 
 # ------------------------------------------------------------------ the two independent channels
-def test_notes_and_voice_are_independent_the_voice_never_sees_the_notes(client, monkeypatch):
-    NOTES = ["# Entropy\n", "## Definition\nA measure of disorder $S=k\\ln W$.\n", "## Second law\nIt never decreases."]
+def test_one_model_writes_the_notes_then_the_voice_elaborates_on_them(client, monkeypatch):
+    NOTES_MD = ["# Entropy\n", "## Definition\nA measure of disorder $S=k\\ln W$.\n", "## Second law\nIt never decreases."]
     sess = FakeSession([[audio(100), said("Think of a tidy room slowly becoming messy. "), audio(50), said("That drift is the story of entropy."), done()]])
     cap = install(monkeypatch, sess)
-    calls = fake_notes(monkeypatch, NOTES)
+    fake_notes(monkeypatch, NOTES_MD)
     with client.websocket_connect("/api/live") as ws:
         start(ws, voice="Kore")
         ready = ws.receive_json()
@@ -218,69 +245,43 @@ def test_notes_and_voice_are_independent_the_voice_never_sees_the_notes(client, 
         ws.send_json({"type": "text", "text": "Explain entropy"})
         frames, nbytes = collect(ws)
     kinds = [f["type"] for f in frames]
-    assert kinds[0] == "conversation" and "notes_delta" in kinds and "notes_done" in kinds and kinds[-1] == "turn_complete" and kinds.count("turn_complete") == 1
-    assert kinds.index("notes_done") < kinds.index("turn_complete"), "turn completes only after BOTH channels are done"
+    assert kinds[0] == "conversation" and kinds[-1] == "turn_complete" and kinds.count("turn_complete") == 1
+    assert "notes_delta" in kinds and "notes_done" in kinds and "notes_none" not in kinds
+    assert notes_text(frames) == "".join(NOTES_MD), "the text on screen is exactly what the model wrote with its own tool call"
     assert nbytes == 300, "all voice bytes are relayed as binary frames"
-    assert notes_text(frames) == "".join(NOTES)
-    # the Live model only ever received the student's question: no notes text, no tool traffic
-    assert [x.split("\n\n[Teacher note")[0] for x in sess.sent_text] == ["Explain entropy"] and sess.client_content == []
-    assert "Teacher note" in sess.sent_text[0] and "notes" not in sess.sent_text[0].split("Teacher note")[0].lower()
-    assert not cap["cfg"].tools
-    # the notes writer is the normal text-model chain, in notes mode, with the student's settings
-    assert calls[0]["notes_mode"] is True and calls[0]["voice_mode"] is False and calls[0]["message"] == "Explain entropy"
-    assert calls[0]["level"] == "undergraduate" and calls[0]["language"] == "en" and calls[0]["subject"] == "Computer Science"
-    msgs = db.get_messages(cid_of(frames))
+    # the SAME session produced both: one tool call, answered with the instruction to elaborate (not to read the notes)
+    assert sess.tool_calls == ["".join(NOTES_MD)] and len(sess.tool_responses) == 1
+    resp = sess.tool_responses[0][0]
+    assert resp.name == "show_notes" and "NOW SPEAK" in resp.response["result"] and "do not read the notes" in resp.response["result"]
+    assert "most important or hardest part" in resp.response["result"] and "English" in resp.response["result"]
+    assert "first call show_notes" in sess.sent_text[0] and sess.sent_text[0].startswith("Explain entropy")
+    assert [t.function_declarations[0].name for t in cap["cfg"].tools] == ["show_notes"]
+    msgs = sdb.get_messages(cid_of(frames))
     assert msgs[0] == {"role": "user", "content": "Explain entropy"}
-    assert msgs[1] == {"role": "assistant", "content": "".join(NOTES).strip()}
+    assert msgs[1] == {"role": "assistant", "content": "".join(NOTES_MD).strip()}
 
 
-def test_notes_wait_for_the_voice_then_appear_together():
-    """Text and voice must start together: notes are held until the first audio chunk, then released just before it."""
-    class WS:
-        def __init__(self):
-            self.sent = []
-
-        async def send_json(self, j):
-            self.sent.append(("json", j["type"]))
-
-        async def send_bytes(self, b):
-            self.sent.append(("bytes", len(b)))
-
-    async def scenario():
-        ws = WS()
-        lesson = live.Lesson(ws, {"email": EMAIL}, {"level": "undergraduate", "language": "en", "subject": "", "gender": "female", "voice": None, "conversation_id": None})
-        t = lesson.turn = live.Turn()
-        t.question, t.typed = "q", True
-        import time
-        t.hold_until = time.time() + 5
-        await lesson._emit_notes(t, "# Title\n")
-        await lesson._emit_notes(t, "text")
-        assert ws.sent == [], "notes must not be shown before the teacher starts talking"
-        await lesson._on_audio(b"\x01\x02" * 10)
-        await lesson._on_audio(b"\x01\x02" * 10)
-        await lesson._emit_notes(t, "more")                        # after the voice began: shown at once
-        return ws.sent
-
-    assert asyncio.run(scenario()) == [("json", "notes_delta"), ("bytes", 20), ("bytes", 20), ("json", "notes_delta")]
-
-
-def test_notes_are_not_held_forever_if_the_voice_is_slow():
-    class WS:
-        def __init__(self):
-            self.sent = []
-
-        async def send_json(self, j):
-            self.sent.append(j["type"])
-
-    async def scenario():
-        ws = WS()
-        lesson = live.Lesson(ws, {"email": EMAIL}, {"level": "undergraduate", "language": "en", "subject": "", "gender": "female", "voice": None, "conversation_id": None})
-        t = lesson.turn = live.Turn()
-        t.hold_until = 0                                           # the hold window already ran out
-        await lesson._emit_notes(t, "x")
-        return ws.sent
-
-    assert asyncio.run(scenario()) == ["notes_delta"]
+def test_the_notes_reach_the_screen_before_the_voice_starts(client, monkeypatch):
+    """Tool call first, then speech: the written text is on screen when the first audio arrives (never the other way round)."""
+    sess = FakeSession([[audio(10), said("Spoken part."), done()]])
+    install(monkeypatch, sess)
+    fake_notes(monkeypatch, ["# Heaps\nA heap is a tree with an ordering property that makes the minimum easy to find."])
+    order = []
+    with client.websocket_connect("/api/live") as ws:
+        start(ws)
+        ws.receive_json()
+        ws.send_json({"type": "text", "text": "Explain heaps"})
+        while True:
+            m = ws.receive()
+            if m.get("bytes") is not None:
+                order.append("audio")
+                continue
+            j = json.loads(m["text"])
+            if j["type"] in ("notes_delta", "turn_complete"):
+                order.append(j["type"])
+            if j["type"] == "turn_complete":
+                break
+    assert order[0] == "notes_delta" and "audio" in order and order.index("notes_delta") < order.index("audio")
 
 
 @pytest.mark.parametrize("pieces", [[NO_NOTES_MARK], ["[[LUMA_", "NO_NOTES]]"], ["  " + NO_NOTES_MARK + "\n"]])
@@ -295,40 +296,84 @@ def test_small_talk_gets_voice_only_and_the_transcript_is_the_history(client, mo
         frames, _ = collect(ws)
     kinds = [f["type"] for f in frames]
     assert "notes_none" in kinds and "notes_delta" not in kinds
-    assert db.get_messages(cid_of(frames))[1]["content"].startswith("Hi there")
+    assert sdb.get_messages(cid_of(frames))[1]["content"].startswith("Hi there")
 
 
-def test_notes_writer_failure_does_not_break_the_lesson_and_leaks_nothing(client, monkeypatch):
-    sess = FakeSession([[audio(10), said("Let me explain trees in a friendly way. "), done()]])
+def test_the_model_that_forgets_the_tool_still_gets_a_complete_screen_answer(client, monkeypatch):
+    """No show_notes call (the model just talked): the spoken answer is shown as the text and saved, nothing is left empty."""
+    sess = FakeSession([[audio(10), said("Let me explain trees in a friendly way. A tree has nodes and edges."), done()]])
     install(monkeypatch, sess)
-    fake_notes(monkeypatch, ["# Trees\n"], fail=True)
+    fake_notes(monkeypatch, [])
     with client.websocket_connect("/api/live") as ws:
         start(ws)
         ws.receive_json()
         ws.send_json({"type": "text", "text": "Explain trees"})
         frames, _ = collect(ws)
-    assert frames[-1]["type"] == "turn_complete" and "test-key-not-real" not in json.dumps(frames)
-    assert db.get_messages(cid_of(frames))[1]["content"].startswith("# Trees")
+    kinds = [f["type"] for f in frames]
+    assert "notes_none" in kinds and kinds[-1] == "turn_complete" and "test-key-not-real" not in json.dumps(frames)
+    assert sdb.get_messages(cid_of(frames))[1]["content"].startswith("Let me explain trees")
 
 
-def test_slow_notes_hold_the_turn_open_until_done(client, monkeypatch):
-    sess = FakeSession([[audio(10), said("short voice"), done()]])
+class RetrySession(FakeSession):
+    """After a REJECTED tool call the model fixes its notes and calls the tool again, as the real model does with an error response."""
+
+    def __init__(self, scripts, second_notes):
+        super().__init__(scripts)
+        self.second_notes = second_notes
+
+    async def send_tool_response(self, function_responses=None, **kw):
+        self.tool_responses.append(function_responses)
+        if "error" in function_responses[0].response:
+            self.push([tool_call(self.second_notes, "call-2"), done()])
+        elif self.pending_voice is not None:
+            self.push(self.pending_voice)
+            self.pending_voice = None
+
+
+def test_notes_in_the_wrong_language_are_rejected_to_the_model_and_rewritten_before_the_student_sees_them(client, monkeypatch):
+    good_urdu = "# ریکرشن\n\n## تعریف\nریکرشن ایک ایسا طریقہ ہے جس میں فنکشن اپنے آپ کو چھوٹے مسئلے پر دوبارہ کال کرتا ہے، یہاں تک کہ base case آ جائے۔"
+    sess = RetrySession([[audio(10), said("آئینے کی مثال۔"), done()]], good_urdu)
     install(monkeypatch, sess)
-    fake_notes(monkeypatch, ["# A\n", "b ", "c ", "d"], delay=0.25)
+    fake_notes(monkeypatch, ["# Recursion\nRecursion is a function that calls itself until a base case stops it, and every call waits for the next one to finish."])
+    with client.websocket_connect("/api/live") as ws:
+        start(ws, language="ur")
+        ws.receive_json()
+        ws.send_json({"type": "text", "text": "What is recursion?"})
+        frames, _ = collect(ws)
+    assert notes_text(frames) == good_urdu, "the English attempt never reached the screen"
+    first = sess.tool_responses[0][0].response
+    assert "error" in first and "Urdu" in first["error"] and "show_notes again" in first["error"]
+    assert "NOW SPEAK" in sess.tool_responses[1][0].response["result"]
+    assert sdb.get_messages(cid_of(frames))[1]["content"] == good_urdu
+
+
+def test_a_second_tool_call_in_the_same_turn_changes_nothing(client, monkeypatch):
+    class Twice(FakeSession):
+        async def send_tool_response(self, function_responses=None, **kw):
+            self.tool_responses.append(function_responses)
+            if len(self.tool_responses) == 1:
+                self.push([tool_call("# Other notes\nthat must not replace the first ones, however long they are, because one answer has one set of notes.", "call-2"), done()])
+            elif self.pending_voice is not None:
+                self.push(self.pending_voice)
+                self.pending_voice = None
+
+    sess = Twice([[audio(10), said("voice"), done()]])
+    install(monkeypatch, sess)
+    fake_notes(monkeypatch, ["# First notes\nThese are the notes that stay on the screen for this answer, complete and correct."])
     with client.websocket_connect("/api/live") as ws:
         start(ws)
         ws.receive_json()
         ws.send_json({"type": "text", "text": "q"})
         frames, _ = collect(ws)
-    kinds = [f["type"] for f in frames]
-    assert kinds.index("notes_done") < kinds.index("turn_complete") and notes_text(frames) == "# A\nb c d"
+    assert notes_text(frames).startswith("# First notes") and "Other notes" not in notes_text(frames)
+    assert "already on the screen" in sess.tool_responses[1][0].response["result"]
 
 
 # ------------------------------------------------------------------ spoken (microphone) questions
-def test_spoken_question_starts_the_notes_when_the_voice_starts_and_is_saved(client, monkeypatch):
+def test_spoken_question_gets_notes_and_voice_from_the_same_model_and_is_saved(client, monkeypatch):
     sess = FakeSession([[heard("what is "), heard("recursion"), audio(10), said("Imagine two mirrors facing each other."), done()]])
     install(monkeypatch, sess)
-    calls = fake_notes(monkeypatch, ["# Recursion\n", "A function that calls itself."])
+    fake_notes(monkeypatch, ["# Recursion\n", "A function that calls itself until a base case stops it, one call at a time."])
     with client.websocket_connect("/api/live") as ws:
         start(ws)
         ws.receive_json()
@@ -337,10 +382,10 @@ def test_spoken_question_starts_the_notes_when_the_voice_starts_and_is_saved(cli
         ws.send_json({"type": "mic_stop"})
         ws.send_json({"type": "stop"})
     assert sess.sent_audio == [("audio/pcm;rate=16000", 3200)] and sess.audio_end == 1
-    assert calls and calls[0]["message"] == "what is recursion" and calls[0]["notes_mode"] is True
-    m = db.get_messages(cid_of(frames))
+    assert len(sess.tool_calls) == 1
+    m = sdb.get_messages(cid_of(frames))
     assert m[0] == {"role": "user", "content": "what is recursion"} and m[1]["content"].startswith("# Recursion")
-    assert any(f["type"] == "caption" and f["who"] == "user" for f in frames)
+    assert any(f["type"] == "caption" and f["who"] == "user" for f in frames) and "notes_delta" in [f["type"] for f in frames]
 
 
 # ------------------------------------------------------------------ Stop, new questions, history
@@ -349,7 +394,7 @@ def test_stop_silences_the_voice_keeps_the_notes_and_the_okay_is_not_saved(clien
                         [audio(3), said("Okay."), done()],                                  # ...the reply to the Stop note
                         [audio(10), said("A heap is a tree."), done()]])                    # the next real question
     install(monkeypatch, sess)
-    fake_notes(monkeypatch, ["# Trees\n", "Nodes and edges."], delay=0.15)
+    fake_notes(monkeypatch, ["# Trees\n", "Nodes and edges, the basic parts of every tree structure in computer science."])
     with client.websocket_connect("/api/live") as ws:
         start(ws)
         ws.receive_json()
@@ -365,46 +410,18 @@ def test_stop_silences_the_voice_keeps_the_notes_and_the_okay_is_not_saved(clien
         collect(ws)
     nudge = [c for c in sess.client_content if c[1] is True]
     assert len(nudge) == 1 and "pressed Stop" in nudge[0][0].parts[0].text
-    assert nbytes == 0, "the Okay after Stop must not be played"
-    m = db.get_messages(db.list_conversations(EMAIL)[0]["id"])
+    assert nbytes <= 20, "only the first answer's own audio may have played: the Okay after Stop must not be played"
+    m = sdb.get_messages(sdb.list_conversations(EMAIL)[0]["id"])
     roles = [(x["role"], x["content"][:14]) for x in m]
     assert ("assistant", "Okay.") not in roles
     assert any(r == "user" and c.startswith("Explain trees") for r, c in roles) and any(c.startswith("What is a heap") for _, c in roles)
     assert any(r == "assistant" and c.startswith("# Trees") for r, c in roles), "the notes of the cut-off answer are kept"
 
 
-def test_a_new_question_cancels_the_previous_notes(client, monkeypatch):
-    sess = FakeSession([[audio(5), said("one"), done()], [audio(5), said("two"), done()]])
-    install(monkeypatch, sess)
-    started = {"n": 0}
-
-    async def gen(message, level, language, history, subject="", voice_mode=False, notes_mode=False):
-        started["n"] += 1
-        if message == "slow one":
-            for i in range(100):                              # would take 20 s
-                await asyncio.sleep(0.2)
-                yield f"s{i} "
-        else:
-            yield "# Fast\nanswer"
-
-    monkeypatch.setattr(live, "stream_tutor_reply", gen)
-    with client.websocket_connect("/api/live") as ws:
-        start(ws)
-        ws.receive_json()
-        ws.send_json({"type": "text", "text": "slow one"})
-        while ws.receive_json()["type"] != "language":       # conversation, then the notes worker announces itself
-            pass
-        ws.send_json({"type": "text", "text": "fast two"})
-        frames, _ = collect(ws)
-    assert started["n"] == 2
-    roles = [(m["role"], m["content"][:6]) for m in db.get_messages(db.list_conversations(EMAIL)[0]["id"])]
-    assert ("assistant", "# Fast") in roles and sum(1 for r, _ in roles if r == "user") == 2
-
-
 def test_continue_old_chat_reseeds_context_without_a_reply(client, monkeypatch):
-    cid = db.create_conversation(EMAIL, "Old chat")
-    db.add_message(cid, "user", "What is a B-tree?")
-    db.add_message(cid, "assistant", "A balanced search tree used by databases.")
+    cid = sdb.create_conversation(EMAIL, "Old chat")
+    sdb.add_message(cid, "user", "What is a B-tree?")
+    sdb.add_message(cid, "assistant", "A balanced search tree used by databases.")
     sess = FakeSession([])
     install(monkeypatch, sess)
     with client.websocket_connect("/api/live") as ws:
@@ -415,25 +432,10 @@ def test_continue_old_chat_reseeds_context_without_a_reply(client, monkeypatch):
     assert turn_complete is False and "B-tree" in turns.parts[0].text
 
 
-def test_notes_writer_gets_the_conversation_history_like_the_text_chat(client, monkeypatch):
-    cid = db.create_conversation(EMAIL, "Chat")
-    db.add_message(cid, "user", "What is a B-tree?")
-    db.add_message(cid, "assistant", "A balanced search tree.")
-    sess = FakeSession([[audio(5), said("ok"), done()]])
-    install(monkeypatch, sess)
-    calls = fake_notes(monkeypatch, ["# Nodes\nx"])
-    with client.websocket_connect("/api/live") as ws:
-        start(ws, conversation_id=cid)
-        ws.receive_json()
-        ws.send_json({"type": "text", "text": "And how are nodes split?"})
-        collect(ws)
-    assert [h["content"] for h in calls[0]["history"]] == ["What is a B-tree?", "A balanced search tree."]
-
-
 def test_cannot_open_someone_elses_conversation(client, monkeypatch):
-    db.upsert_user("other@tuf.edu.pk", "Other", "")
-    other = db.create_conversation("other@tuf.edu.pk", "Not yours")
-    db.add_message(other, "user", "private question")
+    sdb.upsert_user("other@tuf.edu.pk", "Other", "")
+    other = sdb.create_conversation("other@tuf.edu.pk", "Not yours")
+    sdb.add_message(other, "user", "private question")
     sess = FakeSession([])
     install(monkeypatch, sess)
     with client.websocket_connect("/api/live") as ws:
@@ -459,9 +461,11 @@ def test_rejects_oversize_and_empty_text(client, monkeypatch):
         start(ws)
         ws.receive_json()
         ws.send_json({"type": "text", "text": "x" * 4001})
-        assert ws.receive_json()["type"] == "error"
+        j = ws.receive_json()
+        assert j["type"] == "notice" and j["code"] == "MESSAGE_TOO_LONG" and j["retryable"] is False
         ws.send_json({"type": "text", "text": "   "})
-        assert ws.receive_json()["type"] == "error"
+        j = ws.receive_json()
+        assert j["type"] == "notice" and j["code"] == "BAD_REQUEST"
 
 
 def test_daily_limit_applies(client, monkeypatch):
@@ -495,8 +499,8 @@ def test_restarting_right_after_ending_waits_for_the_old_session(client, monkeyp
     """Real bug: End -> Live again said 'already open in another tab' because the old session was still closing."""
     import threading
     install(monkeypatch, FakeSession([]))
-    live._active_users.add(EMAIL)
-    threading.Timer(0.6, lambda: live._active_users.discard(EMAIL)).start()
+    assert asyncio.run(state.acquire_lesson(EMAIL, 99)) == "ok"
+    threading.Timer(0.6, lambda: asyncio.run(state.release_lesson(EMAIL))).start()
     monkeypatch.setattr(config, "LIVE_START_WAIT", 4)
     with client.websocket_connect("/api/live") as ws:
         start(ws)
@@ -508,7 +512,7 @@ def test_not_configured_without_key(client, monkeypatch):
     monkeypatch.setattr(config, "GEMINI_API_KEY", "")
     with client.websocket_connect("/api/live") as ws:
         j = ws.receive_json()
-        assert j["type"] == "error" and "not configured" in j["message"]
+        assert j["type"] == "error" and j["code"] == "LIVE_NOT_CONFIGURED"
 
 
 def test_errors_never_leak_details_or_key(client, monkeypatch):
@@ -548,7 +552,7 @@ def test_reconnects_mid_answer_and_the_teacher_carries_on(client, monkeypatch):
     turns, turn_complete = second.client_content[-1]
     txt = turns.parts[0].text
     assert turn_complete is True and "Explain photosynthesis" in txt and "solar farms" in txt and "carry on" in txt
-    m = db.get_messages(cid_of(frames))
+    m = sdb.get_messages(cid_of(frames))
     assert len(m) == 2 and m[1]["content"].startswith("# Photosynthesis"), "one clean user/assistant pair"
 
 
@@ -580,7 +584,8 @@ def test_existing_endpoints_unchanged(client):
 
 def test_prompt_demands_a_real_lesson_not_a_30_second_answer():
     p = live.build_live_prompt("undergraduate", "en")
-    assert "at least 250 words" in p and "ONE complete worked example" in p and "common mistake" in p
+    assert "at least 250 words" in p and "worked example" in p and "common mistake" in p and "finish every sentence" not in p.split("LENGTH")[0]
+    assert "never cut off" in p
 
 
 def test_teaching_note_is_sent_to_the_voice_but_never_saved(client, monkeypatch):
@@ -593,7 +598,7 @@ def test_teaching_note_is_sent_to_the_voice_but_never_saved(client, monkeypatch)
         ws.send_json({"type": "text", "text": "What is a mutex?"})
         frames, _ = collect(ws)
     assert "two to three minutes" in sess.sent_text[0]
-    assert db.get_messages(cid_of(frames))[0]["content"] == "What is a mutex?"
+    assert sdb.get_messages(cid_of(frames))[0]["content"] == "What is a mutex?"
 
 
 def test_teaching_note_is_in_the_students_language_so_urdu_stays_in_urdu_script():
@@ -651,112 +656,34 @@ def test_config_never_asks_the_browser_to_clear_its_cache():
         assert "clear-site-data" not in r.headers and "luma_cv" not in r.cookies
 
 
-# ------------------------------------------------------------------ language follows the question (not only the selector)
-URDU_Q = "کمپیوٹر میں ریکرشن کیا ہوتی ہے؟ آسان انداز میں سمجھائیں۔"
-
-
-@pytest.mark.parametrize("text,default,expected", [
-    (URDU_Q, "en", "ur"),                                    # Urdu question, selector says English
-    ("ریکرشن کیا ہے", "en", "ur"),
-    ("What is recursion?", "en", "en"),
-    ("What is recursion?", "ur", "ur"),                      # Latin script keeps the selected language (as the normal chat does)
-    ("ما هي العودية في البرمجة؟", "en", "ar"),               # Arabic
-    ("بازگشت در برنامه نویسی چیست؟ چگونه کار می کند", "en", "fa"),
-    ("بازگشت در برنامه نویسی چیست؟ چگونه کار می کند", "ur", "ur"),
-    ("", "ur", "ur"),
-    ("Erkläre mir bitte, wie Rekursion funktioniert.", "en", "de"),      # German question, selector says English
-    ("Was ist der Unterschied zwischen einem Array und einer Liste?", "en", "de"),
-    ("What is the difference between an array and a list?", "de", "en"), # English question, selector says German
-    ("Rekursion", "de", "de"),                                           # too short to tell: keeps the selector
-    ("Rekursion", "en", "en"),
-    ("Was ist Rekursion?", "ur", "ur"),                                  # other selectors are left alone (Roman Urdu etc.)
-])
-def test_detect_language(text, default, expected):
-    assert live.detect_language(text, default) == expected
-
-
-def test_asking_in_urdu_while_the_selector_says_english_gets_urdu_everywhere(client, monkeypatch):
-    sess = FakeSession([[audio(10), said("آئینے والی مثال سوچیں۔"), done()]])
-    install(monkeypatch, sess)
-    calls = fake_notes(monkeypatch, ["# ریکرشن\nایک فنکشن جو خود کو کال کرتا ہے۔"])
-    with client.websocket_connect("/api/live") as ws:
-        start(ws, language="en")
-        ws.receive_json()
-        ws.send_json({"type": "text", "text": URDU_Q})
-        frames, _ = collect(ws)
-    assert [f for f in frames if f["type"] == "language"][0]["language"] == "ur", "the page is told to switch to Urdu"
-    assert calls[0]["language"] == "ur", "the notes are written in Urdu"
-    assert "اردو رسم الخط" in sess.sent_text[0], "the voice gets its teaching note in Urdu"
-    assert "Teacher note" not in sess.sent_text[0]
-
-
-def test_asking_in_english_while_the_selector_says_english_stays_english(client, monkeypatch):
-    sess = FakeSession([[audio(10), said("hi"), done()]])
-    install(monkeypatch, sess)
-    calls = fake_notes(monkeypatch, ["# A\nx"])
-    with client.websocket_connect("/api/live") as ws:
-        start(ws, language="en")
-        ws.receive_json()
-        ws.send_json({"type": "text", "text": "What is recursion?"})
-        collect(ws)
-    assert calls[0]["language"] == "en" and "Teacher note" in sess.sent_text[0]
-
-
-def test_spoken_urdu_question_gets_urdu_notes(client, monkeypatch):
-    sess = FakeSession([[heard("ریکرشن کیا ہوتی ہے"), audio(10), said("سوچیں۔"), done()]])
-    install(monkeypatch, sess)
-    calls = fake_notes(monkeypatch, ["# ریکرشن\nx"])
-    with client.websocket_connect("/api/live") as ws:
-        start(ws, language="en")
-        ws.receive_json()
-        ws.send_bytes(b"\x00\x00" * 1600)
-        frames, _ = collect(ws)
-    assert calls[0]["language"] == "ur" and any(f["type"] == "language" and f["language"] == "ur" for f in frames)
-
-
-def test_prompt_follows_the_language_of_the_question_and_knows_every_style():
+# ------------------------------------------------------------------ the language policy lives in tests/test_language_flow.py
+def test_prompt_makes_the_selected_language_win_and_knows_every_style():
     p = live.build_live_prompt("undergraduate", "en")
-    assert "language the student used in their latest message" in p and "Never answer in English to a question asked in Urdu" in p
-    assert "[Urdu]" in p and "BOLCHAAL" in p and "[English]" in p and "[Arabic]" in p and "[Persian]" in p
-    assert "speak strictly in" not in p
-
-
-@pytest.mark.parametrize("text", ["इसको हिंदी में बताएं। इसको आप उर्दू में बताएं।", "मुझे उर्दू में बताइए, उर्दू में।", "रिकर्शन क्या होता है"])
-@pytest.mark.parametrize("default", ["en", "ur", "ar"])
-def test_hindi_script_from_the_speech_recognizer_is_treated_as_urdu(text, default):
-    """Real bug: a spoken Urdu question was transcribed in Devanagari, detected as English, and answered with English notes."""
-    assert live.detect_language(text, default) == "ur"
+    assert "LANGUAGE POLICY" in p and "chose English in the interface" in p and "does NOT depend on the language the student asks in" in p
+    assert "explicitly asks" in p and "[Urdu]" in p and "BOLCHAAL" in p and "[English]" in p and "[Arabic]" in p and "[Persian]" in p
+    assert "[German]" in p and "Language" in p
+    assert "chose Urdu in the interface" in live.build_live_prompt("undergraduate", "ur")
 
 
 def test_prompt_insists_on_urdu_not_hindi():
     p = live.build_live_prompt("undergraduate", "en")
-    assert "HINDI VS URDU" in p and "ALWAYS answer in URDU" in p and "never Devanagari" in p and "NEVER Hindi/Devanagari" in p
-
-
-def test_spoken_hindi_script_question_gets_urdu_notes(client, monkeypatch):
-    sess = FakeSession([[heard("इसको आप उर्दू में बताएं"), audio(10), said("ٹھیک ہے۔"), done()]])
-    install(monkeypatch, sess)
-    calls = fake_notes(monkeypatch, ["# مارکیٹنگ\nx"])
-    with client.websocket_connect("/api/live") as ws:
-        start(ws, language="en")
-        ws.receive_json()
-        ws.send_bytes(b"\x00\x00" * 1600)
-        frames, _ = collect(ws)
-    assert calls[0]["language"] == "ur" and any(f["type"] == "language" and f["language"] == "ur" for f in frames)
+    assert "HINDI VS URDU" in p and "never Devanagari" in p and "NEVER Hindi/Devanagari" in p
 
 
 def test_microphone_noise_does_not_open_a_turn(client, monkeypatch):
     """Real bug: room noise was transcribed as 'A' and showed up as a user message with an empty answer."""
     sess = FakeSession([[heard("A"), audio(5), said("hello"), done()]])
     install(monkeypatch, sess)
-    calls = fake_notes(monkeypatch, ["# x\ny"])
-    convs_before = len(db.list_conversations(EMAIL))
+    fake_notes(monkeypatch, [])                              # the model just says "hello" to the noise: no study question, no notes
+    convs_before = len(sdb.list_conversations(EMAIL))
     with client.websocket_connect("/api/live") as ws:
         start(ws)
         ws.receive_json()
         ws.send_bytes(b"\x00\x00" * 1600)
         ws.receive()                                         # the voice bytes: no user caption, no notes, no history
-        usage_before = usage._usage.get(EMAIL)
+        probe = asyncio.run(state.incr_daily(EMAIL, 100))           # remaining == 99 means this was the very first message counted
         ws.send_json({"type": "stop"})
-    assert calls == [] and usage_before is None
-    assert len(db.list_conversations(EMAIL)) == convs_before, "no conversation may be created for noise"
+    assert sess.tool_calls == [] and probe == (True, 99), "noise must not be counted as a question"
+    assert len(sdb.list_conversations(EMAIL)) == convs_before, "no conversation may be created for noise"
+
+

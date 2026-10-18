@@ -10,3 +10,7 @@ data/
 .venv/
 node_modules/
 certs/
+data_backup_*/
+tests/e2e/.vendor/
+.pytest_cache/
+.vscode/
